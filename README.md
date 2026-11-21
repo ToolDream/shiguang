@@ -61,7 +61,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/shiguang.nim` | 应用入口、Leaf 设置窗口、消息循环接线 |
+| `src/shiguang.nim` | 应用入口、设置窗口状态与消息循环接线 |
 | `src/desktop_win.c` | 托盘、全局热键、桌面遮罩、选区交互 |
 | `src/editor.c` / `src/editor_win.c` | 标注模型与历史、工具栏布局、Win32 编辑窗口 |
 | `src/settings_view.nim` | 设置界面的视图描述与快捷键键帽 |
@@ -90,7 +90,7 @@ if ($LASTEXITCODE -ne 0) { throw "拾光截图构建失败" }
 **1. 设置视图能力检查**（需要 Nim 与相邻的 Leaf 源码。对照 Leaf 的 Win32 能力表，检查五种设置视图是否只使用受支持的布局与组件；这是构建期的静态能力检查，不等于 Windows 运行验证）：
 
 ~~~sh
-nim c -r --path:../leaf/src tests/settings_capabilities_test.nim
+nim c -r --path:../leaf/src --nimcache:build/nimcache --out:build/settings_capabilities_test tests/settings_capabilities_test.nim
 ~~~
 
 **2. 平台无关的 C 逻辑测试**（Linux 或 MinGW 可运行，覆盖裁切几何、编辑历史、工具栏布局与热键编码）：

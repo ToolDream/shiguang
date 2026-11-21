@@ -1,0 +1,354 @@
+#define UNICODE
+#include "editor_win.h"
+#include <commctrl.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define PANEL_CLASS L"Shiguang.EditorPanel"
+const COLORREF palette[COLORS] = {
+    RGB(233, 74, 68), RGB(28, 113, 208), RGB(32, 156, 105),
+    RGB(255, 191, 38), RGB(36, 49, 65), RGB(255, 255, 255)
+};
+
+int canvas_open(Canvas *c, const Image *base) {
+    BITMAPINFO info = {.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER), .biWidth = base->width,
+        .biHeight = -base->height, .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB}};
+    void *bits = NULL;
+    HDC screen = GetDC(NULL);
+    if (!screen) return 0;
+    c->dc = CreateCompatibleDC(screen);
+    c->dib = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, screen);
+    if (!c->dc || !c->dib || !bits || !(c->previous = SelectObject(c->dc, c->dib))) return 0;
+    c->image = (Image){base->width, base->height, bits};
+    return 1;
+}
+
+void canvas_close(Canvas *c) {
+    if (c->previous) SelectObject(c->dc, c->previous);
+    if (c->dib) DeleteObject(c->dib);
+    if (c->dc) DeleteDC(c->dc);
+    *c = (Canvas){0};
+}
+
+HFONT mark_font(int height) {
+    return CreateFontW(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                       0, 0, NONANTIALIASED_QUALITY, 0, L"Microsoft YaHei UI");
+}
+
+static BOOL draw_mark(HDC dc, const Mark *m) {
+    if (m->tool == TEXT) {
+        if (!m->text || !*m->text) return TRUE;
+        HFONT font = mark_font(m->width);
+        HGDIOBJ old = font ? SelectObject(dc, font) : NULL;
+        BOOL ok = old && SetBkMode(dc, TRANSPARENT) && SetTextColor(dc, m->color) != CLR_INVALID &&
+            TextOutW(dc, m->x, m->y, m->text, (int)wcslen(m->text));
+        if (old) SelectObject(dc, old);
+        if (font) DeleteObject(font);
+        return ok;
+    }
+    HPEN pen = CreatePen(PS_SOLID, m->width, m->color);
+    HGDIOBJ old = pen ? SelectObject(dc, pen) : NULL;
+    HGDIOBJ brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    BOOL ok = old && brush;
+    if (ok) {
+        int x = m->x, y = m->y, ex = m->end_x, ey = m->end_y;
+        Rect r = drag_rect(x, y, ex, ey);
+        int l = r.left, t = r.top, right = r.right, b = r.bottom;
+        int cx = l + (right - l) / 2, cy = t + (b - t) / 2;
+        switch (m->tool) {
+        case RECTANGLE:
+            ok = Rectangle(dc, l, t, right + 1, b + 1);
+            break;
+        case CIRCLE:
+        case ELLIPSE:
+            ok = Ellipse(dc, l, t, right + 1, b + 1);
+            break;
+        case TRIANGLE:
+            ok = Polygon(dc, (POINT[]){{cx, t}, {right, b}, {l, b}}, 3);
+            break;
+        case DIAMOND:
+            ok = Polygon(dc, (POINT[]){{cx, t}, {right, cy}, {cx, b}, {l, cy}}, 4);
+            break;
+        case ARROW: {
+            double dx = (double)ex - x, dy = (double)ey - y, len = hypot(dx, dy);
+            if (len < 1.0) break;
+            double head = fmin(len * 0.65, m->width * 6.0), ux = dx / len, uy = dy / len;
+            int lx = ex + (int)lround(head * (-ux + 0.48 * uy));
+            int ly = ey + (int)lround(head * (-uy - 0.48 * ux));
+            int rx = ex + (int)lround(head * (-ux - 0.48 * uy));
+            int ry = ey + (int)lround(head * (-uy + 0.48 * ux));
+            ok = Polyline(dc, (POINT[]){{x, y}, {ex, ey}, {lx, ly}}, 3) &&
+                 Polyline(dc, (POINT[]){{ex, ey}, {rx, ry}}, 2);
+            break;
+        }
+        case PEN:
+            if (!m->count) break;
+            ok = MoveToEx(dc, m->points[0].x, m->points[0].y, NULL);
+            for (size_t i = 1; ok && i < m->count; ++i)
+                ok = LineTo(dc, m->points[i].x, m->points[i].y);
+            // LineTo excludes its endpoint; keep a click and the final endpoint visible.
+            if (ok) {
+                EditPoint p = m->points[m->count - 1];
+                HBRUSH dot = CreateSolidBrush(m->color);
+                int half = m->width / 2;
+                ok = dot && FillRect(dc, &(RECT){p.x-half, p.y-half, p.x-half+m->width,
+                    p.y-half+m->width}, dot);
+                if (dot) DeleteObject(dot);
+            }
+            break;
+        case TEXT:
+            break;
+        }
+    }
+    if (brush) SelectObject(dc, brush);
+    if (old) SelectObject(dc, old);
+    if (pen) DeleteObject(pen);
+    return ok;
+}
+
+int canvas_render(Canvas *c, const Image *base, const History *h, const Mark *draft) {
+    size_t bytes = image_bytes(base->width, base->height);
+    if (!GdiFlush()) return 0;
+    memcpy(c->image.bgra, base->bgra, bytes);
+    BOOL ok = TRUE;
+    for (size_t i = 0; ok && i < h->used; ++i) ok = draw_mark(c->dc, &h->marks[i]);
+    if (ok && draft) ok = draw_mark(c->dc, draft);
+    if (!GdiFlush() || !ok) return 0;
+    // Frozen monitor pixels are opaque. Holes start as transparent black;
+    // full-coverage non-black inks turn only touched hole pixels opaque.
+    if (h->used || draft) {
+        uint32_t *pixels = (uint32_t *)c->image.bgra;
+        const unsigned char *bgra = base->bgra;
+        for (size_t i = 0; i < bytes / 4; ++i)
+            pixels[i] = (pixels[i] & 0xffffffu) |
+                ((bgra[4*i + 3] || (pixels[i] & 0xffffffu)) ? 0xff000000u : 0);
+    }
+    return 1;
+}
+
+static const WCHAR *const labels[] = {
+    L"形状", L"箭头", L"自由画笔", L"文字", L"颜色", L"撤销", L"重做", L"保存 PNG（Ctrl+S）", L"复制（Enter）"
+};
+static const WCHAR *const shape_labels[] = {L"矩形", L"圆", L"椭圆", L"三角形", L"菱形"};
+static const WCHAR *const color_labels[] = {L"红色", L"蓝色", L"绿色", L"黄色", L"深色", L"白色"};
+
+static const WCHAR *action_label(int action) {
+    unsigned id = (unsigned)action;
+    if (id < BAR_BUTTONS) return labels[id];
+    if (id >= ACT_RECTANGLE && id < ACT_RECTANGLE + SHAPES) return shape_labels[id - ACT_RECTANGLE];
+    if (id >= ACT_RED && id < ACT_RED + COLORS) return color_labels[id - ACT_RED];
+    return NULL;
+}
+
+static void draw_icon(const DRAWITEMSTRUCT *item, const Panel *p) {
+    HDC dc = item->hDC;
+    RECT r = item->rcItem;
+    int action = (int)(item->CtlID - 1u);
+    if (!action_label(action)) return;
+    int saved = SaveDC(dc);
+    if (!saved) return;
+    BOOL selected = (action == ACT_SHAPES && p->tool <= DIAMOND) ||
+                    (action == ACT_ARROW && p->tool == ARROW) || (action == ACT_PEN && p->tool == PEN) ||
+                    (action == ACT_TEXT && p->tool == TEXT) || action == ACT_RECTANGLE + (int)p->shape ||
+                    action == ACT_RED + p->color;
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SetDCPenColor(dc, RGB(218, 226, 235));
+    SetDCBrushColor(dc, selected || (item->itemState & ODS_SELECTED) ?
+                    RGB(229, 239, 254) : RGB(252, 253, 255));
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, 7, 7);
+    COLORREF ink = item->itemState & ODS_DISABLED ? RGB(159, 174, 191) :
+                   selected ? RGB(24, 101, 190) : RGB(53, 73, 96);
+    int size = r.right - r.left;
+    HPEN pen = CreatePen(PS_SOLID, size >= 50 ? 2 : 1, ink);
+    if (pen) SelectObject(dc, pen);
+    else SetDCPenColor(dc, ink);
+    SelectObject(dc, GetStockObject(NULL_BRUSH));
+    int x = (r.left + r.right) / 2, y = (r.top + r.bottom) / 2;
+    int a = size / 4, q = a / 2;
+    if (action == ACT_SHAPES) {
+        x -= a / 3;
+        Polyline(dc, (POINT[]){{x+a+1,y-2},{x+a+4,y+1},{x+a+7,y-2}}, 3);
+        Tool shape = (unsigned)p->shape < SHAPES ? p->shape : RECTANGLE;
+        action = ACT_RECTANGLE + shape;
+    }
+    switch (action) {
+    case ACT_RECTANGLE: Rectangle(dc,x-a,y-q-2,x+a+1,y+q+3); break;
+    case ACT_RECTANGLE+CIRCLE: Ellipse(dc,x-a,y-a,x+a+1,y+a+1); break;
+    case ACT_RECTANGLE+ELLIPSE: Ellipse(dc,x-a,y-q-2,x+a+1,y+q+3); break;
+    case ACT_RECTANGLE+TRIANGLE: Polygon(dc,(POINT[]){{x,y-a},{x+a,y+a},{x-a,y+a}},3); break;
+    case ACT_RECTANGLE+DIAMOND: Polygon(dc,(POINT[]){{x,y-a},{x+a,y},{x,y+a},{x-a,y}},4); break;
+    case ACT_ARROW:
+        Polyline(dc,(POINT[]){{x-a,y+a},{x+a,y-a},{x,y-a}},3);
+        Polyline(dc,(POINT[]){{x+a,y-a},{x+a,y}},2);
+        break;
+    case ACT_PEN:
+        Polygon(dc,(POINT[]){{x-a,y+a},{x-a+2,y+1},{x+q,y-a},{x+a,y-q},{x-1,y+a-2}},5);
+        Polyline(dc,(POINT[]){{x+q-3,y-a+3},{x+a-3,y-q+3}},2);
+        break;
+    case ACT_TEXT:
+        Polyline(dc,(POINT[]){{x-a,y-q},{x-a,y-a},{x+a,y-a},{x+a,y-q}},4);
+        Polyline(dc,(POINT[]){{x,y-a},{x,y+a}},2);
+        Polyline(dc,(POINT[]){{x-q,y+a},{x+q+1,y+a}},2);
+        break;
+    case ACT_UNDO:
+    case ACT_REDO: {
+        int dir = action == ACT_UNDO ? 1 : -1;
+        PolyBezier(dc,(POINT[]){{x-dir*a,y-2},{x+dir*a,y-a},{x+dir*a,y},{x+dir*a,y+a}},4);
+        Polyline(dc,(POINT[]){{x-dir*q,y-a},{x-dir*a,y-2},{x-dir*q,y+q}},3);
+        break;
+    }
+    case ACT_SAVE:
+        Polygon(dc,(POINT[]){{x-a,y-a},{x+q,y-a},{x+a,y-q},{x+a,y+a},{x-a,y+a}},5);
+        Rectangle(dc,x-q,y-a,x+q+1,y);
+        Rectangle(dc,x-q,y+2,x+q+1,y+a+1);
+        break;
+    case ACT_COPY:
+        Polyline(dc,(POINT[]){{x-q,y+q},{x-a,y+q},{x-a,y-a},{x+q,y-a},{x+q,y-q}},5);
+        Rectangle(dc,x-q,y-q,x+a+1,y+a+1);
+        break;
+    default: {
+        int index = action == ACT_COLOR ? p->color : action - ACT_RED;
+        if ((unsigned)index < COLORS) {
+            SelectObject(dc, GetStockObject(DC_BRUSH));
+            SetDCBrushColor(dc, palette[index]);
+            Ellipse(dc,x-a,y-a,x+a+1,y+a+1);
+        }
+        break;
+    }
+    }
+    RestoreDC(dc, saved);
+    if (pen) DeleteObject(pen);
+}
+
+static LRESULT CALLBACK panel_button_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp,
+                                          UINT_PTR id, DWORD_PTR ref) {
+    (void)ref;
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(w, panel_button_proc, id);
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
+        (wp == VK_ESCAPE || wp == VK_RETURN || (wp == 'S' && GetKeyState(VK_CONTROL) < 0))) {
+        HWND overlay = GetAncestor(w, GA_ROOTOWNER);
+        if (overlay && overlay != w) {
+            SendMessageW(overlay, msg, wp, lp);
+            return 0;
+        }
+    }
+    return DefSubclassProc(w, msg, wp, lp);
+}
+
+static LRESULT CALLBACK panel_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCCREATE) {
+        SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW *)lp)->lpCreateParams);
+        return TRUE;
+    }
+    Panel *p = (Panel *)GetWindowLongPtrW(w, GWLP_USERDATA);
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_DRAWITEM && p && lp) {
+        draw_icon((const DRAWITEMSTRUCT *)lp, p);
+        return TRUE;
+    }
+    if (msg == WM_COMMAND && p && lp && HIWORD(wp) == BN_CLICKED) {
+        int action = LOWORD(wp) - 1;
+        if (action_label(action)) p->click(action);
+        return 0;
+    }
+    return DefWindowProcW(w, msg, wp, lp);
+}
+
+BOOL register_panel(HINSTANCE instance) {
+    WNDCLASSW wc = {.lpfnWndProc = panel_proc, .hInstance = instance, .lpszClassName = PANEL_CLASS,
+        .hCursor = LoadCursorW(NULL, IDC_ARROW), .hbrBackground = (HBRUSH)(COLOR_WINDOW + 1)};
+    return RegisterClassW(&wc) != 0;
+}
+
+BOOL open_panel(Panel *p, HINSTANCE instance, HWND owner, Dock d, int first, int count, void (*click)(int)) {
+    if (d.cell <= 0 || d.cols <= 0 || count <= 0 || count > BAR_BUTTONS) return FALSE;
+    p->click = click;
+    Rect b = d.bounds;
+    p->window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        PANEL_CLASS, L"截图标注", WS_POPUP, b.left, b.top, b.right-b.left, b.bottom-b.top,
+        owner, NULL, instance, p);
+    if (!p->window) return FALSE;
+    HWND tip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, NULL,
+        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT,
+        CW_USEDEFAULT, CW_USEDEFAULT, p->window, NULL, instance, NULL);
+    for (int i = 0; i < count; ++i) {
+        int action = first + i;
+        const WCHAR *label = action_label(action);
+        if (!label) {
+            close_panel(p);
+            return FALSE;
+        }
+        int pad = d.cell >= 24 ? 2 : 0;
+        HWND button = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            i % d.cols * d.cell + pad, i / d.cols * d.cell + pad, d.cell - 2*pad,
+            d.cell - 2*pad, p->window, (HMENU)(intptr_t)(action + 1), instance, NULL);
+        if (!button || !SetWindowSubclass(button, panel_button_proc, 1, 0)) {
+            close_panel(p);
+            return FALSE;
+        }
+        p->buttons[i] = button;
+        if (tip) {
+            TOOLINFOW info = {.cbSize = sizeof info, .uFlags = TTF_IDISHWND | TTF_SUBCLASS,
+                .hwnd = p->window, .uId = (UINT_PTR)button, .lpszText = (WCHAR *)label};
+            SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&info);
+        }
+    }
+    if (!SetWindowPos(p->window, HWND_TOPMOST, 0, 0, 0, 0,
+                      SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)) {
+        close_panel(p);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void close_panel(Panel *p) {
+    if (p->window) DestroyWindow(p->window);
+    *p = (Panel){0};
+}
+
+void update_panel(Panel *p, Tool tool, Tool shape, int color, BOOL undo, BOOL redo) {
+    if (!p->window) return;
+    p->tool = tool;
+    p->shape = shape;
+    p->color = color;
+    for (int i = 0; i < BAR_BUTTONS && p->buttons[i]; ++i) {
+        int id = GetDlgCtrlID(p->buttons[i]) - 1;
+        if (id == ACT_UNDO) EnableWindow(p->buttons[i], undo);
+        if (id == ACT_REDO) EnableWindow(p->buttons[i], redo);
+        InvalidateRect(p->buttons[i], NULL, FALSE);
+    }
+}
+
+HICON shiguang_icon(int size) {
+    if (size <= 0 || size > 256) return NULL;
+    BITMAPINFO info = {.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER), .biWidth = size,
+        .biHeight = -size, .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB}};
+    void *pixels = NULL;
+    HBITMAP color = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, &pixels, NULL, 0);
+    size_t mask_stride = (size_t)((size + 15) / 16 * 2);
+    unsigned char *mask_bits = calloc(mask_stride, (size_t)size);
+    HBITMAP mask = mask_bits ? CreateBitmap(size, size, 1, 1, mask_bits) : NULL;
+    free(mask_bits);
+    HICON icon = NULL;
+    if (color && mask && pixels) {
+        uint32_t *px = pixels;
+        for (int j = 0; j < size; ++j) for (int i = 0; i < size; ++i) {
+            int x = i*32/size, y = j*32/size;
+            int xx = x < 16 ? x : 31-x, yy = y < 16 ? y : 31-y;
+            int dx = xx < 8 ? 8-xx : 0, dy = yy < 8 ? 8-yy : 0;
+            BOOL outline = (xx >= 6 && xx <= 8 && yy >= 6 && yy <= 13) ||
+                           (yy >= 6 && yy <= 8 && xx >= 6 && xx <= 13);
+            BOOL dot = (x-16)*(x-16) + (y-16)*(y-16) <= 11;
+            px[j*size+i] = dx*dx+dy*dy > 46 ? 0u : outline || dot ? 0xfff1f8ffu :
+                (uint32_t)(0xff000000u | ((40-y/2)<<16) | ((143-y)<<8) | (222-y));
+        }
+        ICONINFO iconinfo = {.fIcon = TRUE, .hbmMask = mask, .hbmColor = color};
+        icon = CreateIconIndirect(&iconinfo);
+    }
+    if (color) DeleteObject(color);
+    if (mask) DeleteObject(mask);
+    return icon;
+}

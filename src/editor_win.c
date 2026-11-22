@@ -138,14 +138,21 @@ static BOOL draw_mark(HDC dc, const Mark *m) {
     return ok;
 }
 
-int canvas_render(Canvas *c, const Image *base, const History *h, const Mark *draft) {
+BOOL paint_marks(HDC dc, const History *h, const Mark *draft, EditPoint origin) {
+    if (!h->used && !draft) return TRUE;
+    int saved = SaveDC(dc);
+    if (!saved) return FALSE;
+    BOOL ok = OffsetViewportOrgEx(dc, origin.x, origin.y, NULL);
+    for (size_t i = 0; ok && i < h->used; ++i) ok = draw_mark(dc, &h->marks[i]);
+    if (ok && draft) ok = draw_mark(dc, draft);
+    return RestoreDC(dc, saved) && ok;
+}
+
+int canvas_render(Canvas *c, const Image *base, const History *h, const Mark *draft, EditPoint origin) {
     size_t bytes = image_bytes(base->width, base->height);
     if (!GdiFlush()) return 0;
     memcpy(c->image.bgra, base->bgra, bytes);
-    BOOL ok = TRUE;
-    for (size_t i = 0; ok && i < h->used; ++i) ok = draw_mark(c->dc, &h->marks[i]);
-    if (ok && draft) ok = draw_mark(c->dc, draft);
-    if (!GdiFlush() || !ok) return 0;
+    if (!paint_marks(c->dc, h, draft, origin) || !GdiFlush()) return 0;
     // Frozen monitor pixels are opaque. Holes start as transparent black;
     // full-coverage non-black inks turn only touched hole pixels opaque.
     if (h->used || draft) {
@@ -171,6 +178,8 @@ static const WCHAR *action_label(int action) {
     if (id >= ACT_RED && id < ACT_RED + COLORS) return color_labels[id - ACT_RED];
     return NULL;
 }
+
+#include "toolbar_glyph.h"
 
 static void draw_icon(const DRAWITEMSTRUCT *item, const Panel *p) {
     HDC dc = item->hDC;
@@ -198,70 +207,12 @@ static void draw_icon(const DRAWITEMSTRUCT *item, const Panel *p) {
     SetDCBrushColor(dc, face);
     RoundRect(dc, r.left, r.top, r.right, r.bottom, 12, 12);
     COLORREF ink = disabled ? c->muted : active ? c->active_ink : c->ink;
-    int size = r.right - r.left;
-    HPEN pen = CreatePen(PS_SOLID, size >= 50 ? 2 : 1, ink);
-    if (pen) SelectObject(dc, pen);
-    else SetDCPenColor(dc, ink);
-    SelectObject(dc, GetStockObject(NULL_BRUSH));
-    int x = (r.left + r.right) / 2, y = (r.top + r.bottom) / 2;
-    int a = size / 4, q = a / 2;
-    if (action == ACT_SHAPES) {
-        x -= a / 3;
-        Polyline(dc, (POINT[]){{x+a+1,y-2},{x+a+4,y+1},{x+a+7,y-2}}, 3);
-        Tool shape = (unsigned)p->shape < SHAPES ? p->shape : RECTANGLE;
-        action = ACT_RECTANGLE + shape;
-    }
-    switch (action) {
-    case ACT_RECTANGLE: Rectangle(dc,x-a,y-q-2,x+a+1,y+q+3); break;
-    case ACT_RECTANGLE+CIRCLE: Ellipse(dc,x-a,y-a,x+a+1,y+a+1); break;
-    case ACT_RECTANGLE+ELLIPSE: Ellipse(dc,x-a,y-q-2,x+a+1,y+q+3); break;
-    case ACT_RECTANGLE+TRIANGLE: Polygon(dc,(POINT[]){{x,y-a},{x+a,y+a},{x-a,y+a}},3); break;
-    case ACT_RECTANGLE+DIAMOND: Polygon(dc,(POINT[]){{x,y-a},{x+a,y},{x,y+a},{x-a,y}},4); break;
-    case ACT_ARROW:
-        Polyline(dc,(POINT[]){{x-a,y+a},{x+a,y-a},{x,y-a}},3);
-        Polyline(dc,(POINT[]){{x+a,y-a},{x+a,y}},2);
-        break;
-    case ACT_PEN:
-        Polygon(dc,(POINT[]){{x-a,y+a},{x-a+2,y+1},{x+q,y-a},{x+a,y-q},{x-1,y+a-2}},5);
-        Polyline(dc,(POINT[]){{x+q-3,y-a+3},{x+a-3,y-q+3}},2);
-        break;
-    case ACT_TEXT:
-        Polyline(dc,(POINT[]){{x-a,y-q},{x-a,y-a},{x+a,y-a},{x+a,y-q}},4);
-        Polyline(dc,(POINT[]){{x,y-a},{x,y+a}},2);
-        Polyline(dc,(POINT[]){{x-q,y+a},{x+q+1,y+a}},2);
-        break;
-    case ACT_UNDO:
-    case ACT_REDO: {
-        int dir = action == ACT_UNDO ? 1 : -1;
-        PolyBezier(dc,(POINT[]){{x-dir*a,y-2},{x+dir*a,y-a},{x+dir*a,y},{x+dir*a,y+a}},4);
-        Polyline(dc,(POINT[]){{x-dir*q,y-a},{x-dir*a,y-2},{x-dir*q,y+q}},3);
-        break;
-    }
-    case ACT_SAVE:
-        Polygon(dc,(POINT[]){{x-a,y-a},{x+q,y-a},{x+a,y-q},{x+a,y+a},{x-a,y+a}},5);
-        Rectangle(dc,x-q,y-a,x+q+1,y);
-        Rectangle(dc,x-q,y+2,x+q+1,y+a+1);
-        break;
-    case ACT_COPY:
-        Polyline(dc,(POINT[]){{x-q,y+q},{x-a,y+q},{x-a,y-a},{x+q,y-a},{x+q,y-q}},5);
-        Rectangle(dc,x-q,y-q,x+a+1,y+a+1);
-        break;
-    default: {
-        int index = action == ACT_COLOR ? p->color : action - ACT_RED;
-        if ((unsigned)index < COLORS) {
-            SelectObject(dc, GetStockObject(DC_BRUSH));
-            SetDCBrushColor(dc, palette[index]);
-            Ellipse(dc,x-a,y-a,x+a+1,y+a+1);
-        }
-        break;
-    }
-    }
+    aa_glyph(dc, r, action, p, ink, face);
     if (item->itemState & ODS_FOCUS) {
         InflateRect(&r, -2, -2);
         DrawFocusRect(dc, &r);
     }
     RestoreDC(dc, saved);
-    if (pen) DeleteObject(pen);
 }
 
 static LRESULT CALLBACK panel_button_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp,
@@ -274,6 +225,7 @@ static LRESULT CALLBACK panel_button_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp
         InvalidateRect(w, NULL, FALSE);
     }
     if (msg == WM_MOUSELEAVE) InvalidateRect(w, NULL, FALSE);
+    if ((msg == WM_CHAR || msg == WM_SYSCHAR) && wp == 27) return 0;
     if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
         (wp == VK_ESCAPE || wp == VK_RETURN || (wp == 'S' && GetKeyState(VK_CONTROL) < 0))) {
         HWND overlay = GetAncestor(w, GA_ROOTOWNER);
@@ -343,6 +295,31 @@ BOOL register_panel(HINSTANCE instance) {
     return RegisterClassW(&wc) != 0;
 }
 
+static void panel_corner(HWND w, Dock d) {
+    Rect b = d.bounds;
+    int radius = d.cell >= 24 ? MulDiv(20, (int)GetDpiForWindow(w), 96) : 0;
+    HRGN corner = radius ? CreateRoundRectRgn(0, 0, b.right-b.left+1, b.bottom-b.top+1, radius, radius) : NULL;
+    if (!SetWindowRgn(w, corner, FALSE) && corner) DeleteObject(corner);
+}
+
+static BOOL place_panel_button(HWND w, Dock d, int index) {
+    int pad = d.cell >= 24 ? (d.cell >= 40 ? 4 : 2) : 0;
+    return SetWindowPos(w, NULL, index % d.cols * d.cell + pad, index / d.cols * d.cell + pad,
+        d.cell - 2 * pad, d.cell - 2 * pad, SWP_NOACTIVATE | SWP_NOZORDER);
+}
+
+BOOL move_panel(Panel *p, Dock from, Dock to) {
+    if (!p->window || to.cell <= 0 || to.cols <= 0) return FALSE;
+    Rect b = to.bounds;
+    if (!SetWindowPos(p->window, NULL, b.left, b.top, b.right-b.left, b.bottom-b.top,
+                      SWP_NOACTIVATE | SWP_NOZORDER)) return FALSE;
+    if (from.cell == to.cell && from.cols == to.cols) return TRUE;
+    panel_corner(p->window, to);
+    for (int i = 0; i < BAR_BUTTONS && p->buttons[i]; ++i)
+        if (!place_panel_button(p->buttons[i], to, i)) return FALSE;
+    return InvalidateRect(p->window, NULL, FALSE);
+}
+
 BOOL open_panel(Panel *p, HINSTANCE instance, HWND owner, Dock d, int first, int count, void (*click)(int)) {
     if (d.cell <= 0 || d.cols <= 0 || count <= 0 || count > BAR_BUTTONS) return FALSE;
     p->click = click;
@@ -351,12 +328,7 @@ BOOL open_panel(Panel *p, HINSTANCE instance, HWND owner, Dock d, int first, int
         PANEL_CLASS, L"截图标注", WS_POPUP, b.left, b.top, b.right-b.left, b.bottom-b.top,
         owner, NULL, instance, p);
     if (!p->window) return FALSE;
-    int dpi = (int)GetDpiForWindow(p->window);
-    int radius = d.cell >= 24 ? MulDiv(20, dpi, 96) : 0;
-    if (radius) {
-        HRGN corner = CreateRoundRectRgn(0, 0, b.right-b.left+1, b.bottom-b.top+1, radius, radius);
-        if (corner && !SetWindowRgn(p->window, corner, FALSE)) DeleteObject(corner);
-    }
+    panel_corner(p->window, d);
     HWND tip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, NULL,
         WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT,
         CW_USEDEFAULT, CW_USEDEFAULT, p->window, NULL, instance, NULL);
@@ -367,11 +339,9 @@ BOOL open_panel(Panel *p, HINSTANCE instance, HWND owner, Dock d, int first, int
             close_panel(p);
             return FALSE;
         }
-        int pad = d.cell >= 24 ? (d.cell >= 40 ? 4 : 2) : 0;
         HWND button = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            i % d.cols * d.cell + pad, i / d.cols * d.cell + pad, d.cell - 2*pad,
-            d.cell - 2*pad, p->window, (HMENU)(intptr_t)(action + 1), instance, NULL);
-        if (!button || !SetWindowSubclass(button, panel_button_proc, 1, 0)) {
+            0, 0, 0, 0, p->window, (HMENU)(intptr_t)(action + 1), instance, NULL);
+        if (!button || !place_panel_button(button, d, i) || !SetWindowSubclass(button, panel_button_proc, 1, 0)) {
             close_panel(p);
             return FALSE;
         }

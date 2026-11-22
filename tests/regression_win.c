@@ -2,39 +2,37 @@
 #define UNICODE
 #include "../src/desktop_win.h"
 #include "../src/crop.h"
+#include "../src/editor_win.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
-static BOOL fail_blit, fail_dib, fail_blend;
+static BOOL fail_blit, fail_dib, fail_preview;
 static int copies, blits;
 static HRESULT save_result;
 static BOOL copy_succeeds = TRUE, persist_succeeds = TRUE;
 static DWORD persisted;
 static const Image *expected_copy;
-static HWND close_during_blend, invalidate_in_picker, invalidate_on_flush;
+static HWND close_during_blit, invalidate_in_picker, invalidate_on_flush;
 static const WCHAR *picked_path;
 static unsigned stage_flushes, moves;
 
 static BOOL test_blit(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD op) {
     ++blits;
-    return !fail_blit && BitBlt(dst, x, y, w, h, src, sx, sy, op);
+    if (close_during_blit) {
+        HWND w = close_during_blit;
+        close_during_blit = NULL;
+        SendMessageW(w, WM_CLOSE, 0, 0);
+        assert(IsWindow(w));  // Reentrant cancellation cannot free a live paint target.
+    }
+    return !fail_blit && !(fail_preview && WindowFromDC(dst)) &&
+        BitBlt(dst, x, y, w, h, src, sx, sy, op);
 }
 
 static int test_dib(HDC dst, int x, int y, int w, int h, int sx, int sy, int sw, int sh,
                     const void *bits, const BITMAPINFO *info, UINT usage, DWORD op) {
-    return fail_dib ? GDI_ERROR : StretchDIBits(dst, x, y, w, h, sx, sy, sw, sh, bits, info, usage, op);
-}
-
-static BOOL test_blend(HDC dst, int x, int y, int w, int h, HDC src,
-                       int sx, int sy, int sw, int sh, BLENDFUNCTION blend) {
-    if (close_during_blend) {
-        HWND w = close_during_blend;
-        close_during_blend = NULL;
-        SendMessageW(w, WM_CLOSE, 0, 0);
-        assert(IsWindow(w));  // Reentrant cancellation cannot free a live paint target.
-    }
-    return !fail_blend && AlphaBlend(dst, x, y, w, h, src, sx, sy, sw, sh, blend);
+    return fail_dib || (fail_preview && WindowFromDC(dst)) ? GDI_ERROR :
+        StretchDIBits(dst, x, y, w, h, sx, sy, sw, sh, bits, info, usage, op);
 }
 
 static BOOL create_at_publish;
@@ -117,9 +115,25 @@ static LSTATUS test_persist(HKEY root, LPCWSTR path, LPCWSTR name, DWORD type,
     return ERROR_SUCCESS;  // Never alter the user's configured shortcut.
 }
 
+static BOOL fail_adjust_canvas;
+static HDC failed_canvas_dc;
+static int test_canvas_open(Canvas *target, const Image *image) {
+    if (!fail_adjust_canvas) return canvas_open(target, image);
+    // Fail after acquiring a real resource to verify partial cleanup.
+    failed_canvas_dc = target->dc = CreateCompatibleDC(NULL);
+    assert(failed_canvas_dc);
+    return 0;
+}
+
+static BOOL adjust_alt;
+static SHORT WINAPI test_key_state(int vk) {
+    return adjust_alt && vk == VK_MENU ? (SHORT)0x8000 : GetKeyState(vk);
+}
+
+#define GetKeyState test_key_state
+#define canvas_open test_canvas_open
 #define BitBlt test_blit
 #define StretchDIBits test_dib
-#define AlphaBlend test_blend
 #define publish_image count_copy
 #define save_png_dialog test_save_dialog
 #define RegSetKeyValueW test_persist
@@ -127,9 +141,34 @@ static LSTATUS test_persist(HKEY root, LPCWSTR path, LPCWSTR name, DWORD type,
 #undef RegSetKeyValueW
 #undef save_png_dialog
 #undef publish_image
-#undef AlphaBlend
 #undef StretchDIBits
 #undef BitBlt
+#undef canvas_open
+#undef GetKeyState
+
+static int glyph_pen_calls, glyph_blits, glyph_lines;
+static BOOL fail_glyph_line;
+static HPEN WINAPI test_glyph_pen(DWORD style, DWORD width, const LOGBRUSH *brush,
+                                 DWORD entries, const DWORD *dashes) {
+    if (++glyph_pen_calls == 1 && !fail_glyph_line) return NULL;
+    return ExtCreatePen(style, width, brush, entries, dashes);
+}
+static BOOL WINAPI test_glyph_blit(HDC dst, int x, int y, int w, int h, HDC src,
+                                 int sx, int sy, int sw, int sh, DWORD rop) {
+    ++glyph_blits;
+    return StretchBlt(dst, x, y, w, h, src, sx, sy, sw, sh, rop);
+}
+static BOOL WINAPI test_glyph_line(HDC dc, const POINT *points, int count) {
+    if (++glyph_lines == 1 && fail_glyph_line) return FALSE;
+    return Polyline(dc, points, count);
+}
+#define Polyline test_glyph_line
+#define ExtCreatePen test_glyph_pen
+#define StretchBlt test_glyph_blit
+#include "../src/toolbar_glyph.h"
+#undef StretchBlt
+#undef ExtCreatePen
+#undef Polyline
 
 static void save_test(void) {
     WCHAR folder[MAX_PATH], path[MAX_PATH];
@@ -218,16 +257,109 @@ static HWND small_overlay(void) {
     return w;
 }
 
+static void assert_shaded(uint32_t color, uint32_t original) {
+    for (int shift = 0; shift < 24; shift += 8) {
+        int expected = (int)((original >> shift) & 255u) * 4 / 5;
+        int actual = (int)((color >> shift) & 255u);
+        assert(abs(expected - actual) <= 1);
+    }
+}
+
+// Exercise the real preview painter with deterministic frozen colors and
+// monitor origins, without reading live desktop pixels.
+static void selection_preview_test(void) {
+    assert(open_shade());
+    enum { W = 13, H = 14 };
+    for (size_t i = 0; i < 2; ++i) {
+        HDC source = CreateCompatibleDC(NULL), target = CreateCompatibleDC(NULL);
+        BITMAPINFO info = bitmap_info(W, H);
+        uint32_t *original, *pixels;
+        HBITMAP src = CreateDIBSection(source, &info, DIB_RGB_COLORS, (void **)&original, NULL, 0);
+        HBITMAP dst = CreateDIBSection(target, &info, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
+        assert(src && dst && source && target);
+        HGDIOBJ old_src = SelectObject(source, src), old_dst = SelectObject(target, dst);
+        assert(old_src && old_dst);
+        uint32_t frozen = i ? 0xfff4f4f4u : 0xff171717u;
+        for (int j = 0; j < W * H; ++j) original[j] = frozen;
+        Rect b = {i ? 0 : -W, -H, i ? W : 0, 0};
+        frames[i] = (Frame){b, (unsigned char *)original};
+        surfaces[i].dc = source;
+        const RECT full = {0, 0, W, H};
+
+        assert(!dragging && !base.bgra && draw_preview(target, &full, i) && GdiFlush());
+        assert_shaded(pixels[0], frozen);
+        // Reverse drag spans the seam and touches both monitor edges.
+        selection = drag_rect(W, -2, -W, -H);
+        dragging = TRUE;
+        assert(draw_preview(target, &full, i) && GdiFlush());
+        assert((pixels[0] & 0xffffffu) == (i ? 0u : 0xffffffu));
+        assert((pixels[6] & 0xffffffu) == (i ? 0xffffffu : 0u));
+        assert_shaded(pixels[W * (H - 1)], frozen);
+        // A second row/column under the outline is unchanged, not another dash.
+        assert((pixels[W + 6] & 0xffffffu) == (frozen & 0xffffffu));
+        assert((pixels[5 * W + (i ? W - 2 : 1)] & 0xffffffu) == (frozen & 0xffffffu));
+        assert((pixels[5 * W + (i ? 0 : W - 1)] & 0xffffffu) == (frozen & 0xffffffu));
+        assert((pixels[5 * W + (i ? W - 1 : 0)] & 0xffffffu) == (i ? 0xffffffu : 0u));
+
+        // Repaint only a dirty subrectangle as the active ROI moves. A pixel
+        // leaving the selection is shaded once; a pixel entering it is restored.
+        const RECT dirty = {1, 1, W - 1, H};
+        selection = (Rect){b.left + 2, b.top + 3, b.left + 9, b.top + 9};
+        assert(draw_preview(target, &dirty, i) && GdiFlush());
+        assert_shaded(pixels[2 * W + 5], frozen);
+        assert((pixels[5 * W + 5] & 0xffffffu) == (frozen & 0xffffffu));
+        base = (Image){W, H, (unsigned char *)original};
+        dragging = FALSE;
+        adjust_mode = SEL_MOVE;
+        adjust_area = (Rect){b.left + 2, b.top + 7, b.left + 9, b.bottom};
+        assert(draw_preview(target, &dirty, i) && GdiFlush());
+        assert_shaded(pixels[2 * W + 5], frozen);
+        assert_shaded(pixels[5 * W + 5], frozen);
+        assert((pixels[(H - 2) * W + 5] & 0xffffffu) == (frozen & 0xffffffu));
+        adjust_mode = 0;
+        base = (Image){0};
+        dragging = TRUE;
+
+        for (int side = 2; side <= 4; ++side) {
+            selection = (Rect){b.left + 2, b.top + 2, b.left + 2 + side, b.top + 2 + side};
+            assert(draw_preview(target, &full, i) && GdiFlush());
+            assert((pixels[2 * W + 2] & 0xffffffu) == 0xffffffu);
+            assert(!(pixels[2 * W + 3] & 0xffffffu));
+        }
+        for (int horizontal = 0; horizontal <= 1; ++horizontal) {
+            selection = (Rect){b.left + 2, b.top + 2, b.left + 3 + horizontal, b.top + 4 - horizontal};
+            assert(draw_preview(target, &full, i) && GdiFlush());
+            assert((pixels[2 * W + 2] & 0xffffffu) == 0xffffffu);
+            assert(!(pixels[2 * W + 2 + (horizontal ? 1 : W)] & 0xffffffu));
+        }
+        selection = (Rect){b.left + 2, b.top + 2, b.left + 3, b.top + 3};
+        assert(draw_preview(target, &full, i) && GdiFlush());
+        assert((pixels[2 * W + 2] & 0xffffffu) == (i ? 0u : 0xffffffu));
+        for (int j = 0; j < W * H; ++j) assert(original[j] == frozen);
+        dragging = FALSE;
+        selection = (Rect){0};
+        frames[i] = (Frame){0};
+        surfaces[i].dc = NULL;
+        SelectObject(target, old_dst);
+        SelectObject(source, old_src);
+        DeleteObject(dst);
+        DeleteObject(src);
+        DeleteDC(target);
+        DeleteDC(source);
+    }
+    canvas_close(&shade);
+}
+
 static void preview_test(void) {
     recent = (Image){1, 1, malloc(4)};
     assert(recent.bgra);
     unsigned char *previous = recent.bgra;
 
     // A failed first paint must not arm selection.
-    fail_blend = TRUE;
+    fail_preview = TRUE;
     start_capture();
-    assert(phase == IDLE && layout.count == 0 && recent.bgra == previous && !copies);
-    fail_blend = FALSE;
+    assert(phase == IDLE && layout.count == 0 && recent.bgra == previous && !copies && !shade.dc);
+    fail_preview = FALSE;
 
     HWND overlay = small_overlay();
     RECT dirty = {0, 0, 10, 10};
@@ -240,10 +372,10 @@ static void preview_test(void) {
     fail_blit = fail_dib = FALSE;
 
     overlay = small_overlay();
-    close_during_blend = overlay;
+    close_during_blit = overlay;
     assert(InvalidateRect(overlay, &dirty, FALSE));
     UpdateWindow(overlay);
-    assert(!close_during_blend && layout_invalid && !preview_failed && IsWindow(overlay));
+    assert(!close_during_blit && layout_invalid && !preview_failed && IsWindow(overlay));
     sg_after_dispatch();
     assert(phase == IDLE && !IsWindow(overlay) && recent.bgra == previous && !copies);
 }
@@ -336,14 +468,14 @@ static void render_test(void) {
     assert(canvas_open(&target, &frozen));
     assert(mark_point(&point, 8, 5) && history_add(&marks, &point));
     unsigned char *ink = target.image.bgra + (5 * 32 + 8) * 4;
-    assert(canvas_render(&target, &frozen, &marks, NULL));
+    assert(canvas_render(&target, &frozen, &marks, NULL, (EditPoint){0}));
     assert(!memcmp(ink, (unsigned char[]){68, 74, 233, 255}, 4));
     assert(target.image.bgra[3] == 255 && target.image.bgra[7] == 0);
-    assert(history_undo(&marks) && canvas_render(&target, &frozen, &marks, NULL));
+    assert(history_undo(&marks) && canvas_render(&target, &frozen, &marks, NULL, (EditPoint){0}));
     assert(!memcmp(ink, (unsigned char[]){0, 0, 0, 0}, 4));
-    assert(history_redo(&marks) && canvas_render(&target, &frozen, &marks, NULL) && ink[3] == 255);
+    assert(history_redo(&marks) && canvas_render(&target, &frozen, &marks, NULL, (EditPoint){0}) && ink[3] == 255);
     Mark text = {.tool = TEXT, .color = RGB(28, 113, 208), .width = 12, .x = 3, .y = 8, .text = L"拾光"};
-    assert(canvas_render(&target, &frozen, &marks, &text));
+    assert(canvas_render(&target, &frozen, &marks, &text, (EditPoint){0}));
     size_t text_pixels = 0;
     for (size_t i = 0; i < sizeof raw; i += 4)
         if (!memcmp(target.image.bgra + i, (unsigned char[]){208, 113, 28, 255}, 4)) ++text_pixels;
@@ -365,15 +497,215 @@ static void release_into_editor(void) {
     assert(base.width == 70 && base.height == 54 && canvas.image.bgra);
 }
 
+static void toolbar_glyph_test(void) {
+    const UiPalette saved = ui_colors;
+    ui_colors = ui_palette(FALSE, FALSE);
+    // Drive the production draw dispatch for a diagonal glyph at 100% and 150%.
+    for (int side = 36; side <= 54; side += 18) {
+        HDC dc = CreateCompatibleDC(NULL);
+        uint32_t *pixels;
+        BITMAPINFO info = bitmap_info(side, side);
+        HBITMAP dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
+        assert(dc && dib);
+        HGDIOBJ previous = SelectObject(dc, dib);
+        DRAWITEMSTRUCT item = {.CtlType = ODT_BUTTON, .CtlID = ACT_ARROW + 1, .hDC = dc,
+                               .rcItem = {0, 0, side, side}};
+        assert(SendMessageW(toolbar.window, WM_DRAWITEM, ACT_ARROW + 1, (LPARAM)&item));
+        assert(GdiFlush());
+        int coverage = 0, partial = 0;
+        for (int y = side/6; y < side-side/6; ++y)
+            for (int x = side/6; x < side-side/6; ++x) {
+                uint32_t px = pixels[y * side + x] & 0xffffffu;
+                COLORREF color = RGB(px >> 16, px >> 8, px);
+                if (color != ui_colors.surface) ++coverage;
+                if (color != ui_colors.surface && color != ui_colors.ink) ++partial;
+            }
+        assert(coverage > 30 && partial > 16);
+
+        assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)) && GdiFlush());
+        // Neither a failed allocation nor a failed primitive may blit the tile.
+        DWORD objects = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+        for (int n = 0; n < 8; ++n) {
+            fail_glyph_line = n % 2;
+            glyph_pen_calls = glyph_blits = glyph_lines = 0;
+            aa_glyph(dc, item.rcItem, ACT_ARROW, &toolbar, RGB(0, 0, 0), RGB(255, 255, 255));
+            assert(glyph_pen_calls == 2 && glyph_blits == 0);
+        }
+        assert(GdiFlush() && GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) == objects);
+        int direct = 0;
+        for (int y = side/2 - 1; y <= side/2 + 1; ++y)
+            for (int x = side/2 - 1; x <= side/2 + 1; ++x)
+                if (!(pixels[y * side + x] & 0xffffffu)) ++direct;
+        assert(direct > 0);
+        fail_glyph_line = FALSE;
+        SelectObject(dc, previous);
+        DeleteObject(dib);
+        DeleteDC(dc);
+    }
+    ui_colors = saved;
+}
+
+static void send_edit_mouse(HWND w, UINT msg, POINT at) {
+    assert(!wide_desktop && ScreenToClient(w, &at));
+    SendMessageW(w, msg, msg == WM_LBUTTONUP ? 0 : MK_LBUTTON, MAKELPARAM(at.x, at.y));
+}
+
+static void adjustment_test(void) {
+    release_into_editor();
+    Rect original = selection;
+    HWND w = surfaces[0].window, bar = toolbar.window;
+    unsigned char *previous_recent = recent.bgra;
+    int previous_copies = copies;
+    POINT edge = {original.right - 1, original.bottom - 1};
+    POINT smaller = {edge.x - 40, edge.y - 12};
+    RECT first_bar;
+    assert(GetWindowRect(bar, &first_bar));
+    Mark point = {.tool = PEN, .color = palette[0], .width = 3};
+    assert(mark_point(&point, 60, 20) && history_add(&history, &point));
+    Mark redo = {.tool = RECTANGLE, .color = palette[1], .width = 3, .end_x = 10, .end_y = 10};
+    assert(history_add(&history, &redo) && history_undo(&history));
+    edit_changed();
+    assert(flush_overlays());
+    tool = TEXT;
+    start_mark(w, (POINT){original.left + 12, original.top + 16});
+    HWND field = text_input;
+    assert(field && SetWindowTextW(field, L"保留输入"));
+
+    // A failed allocation leaves the original crop, edit, and redo states intact.
+    unsigned char *original_pixels = base.bgra;
+    HDC original_canvas = canvas.dc;
+    if (wide_desktop) assert(start_adjustment(w, SEL_E | SEL_S, edge));
+    else send_edit_mouse(w, WM_LBUTTONDOWN, edge);
+    assert(adjust_mode == (SEL_E | SEL_S) && !drawing);
+    if (wide_desktop) update_adjustment(smaller);
+    else send_edit_mouse(w, WM_MOUSEMOVE, smaller);
+    assert(bar_dock.bounds.top != first_bar.top && toolbar.window == bar);
+    fail_adjust_canvas = TRUE;
+    if (wide_desktop) finish_adjustment(w, TRUE);
+    else send_edit_mouse(w, WM_LBUTTONUP, smaller);
+    fail_adjust_canvas = FALSE;
+    assert(failed_canvas_dc && GetObjectType(failed_canvas_dc) == 0);
+    assert(same_rect(selection, original) && base.bgra == original_pixels && canvas.dc == original_canvas);
+    assert(bar_dock.bounds.top == first_bar.top && recent.bgra == previous_recent && copies == previous_copies);
+    assert(text_input == field && !adjust_mode && !drawing && history.used == 1 && history.total == 2);
+
+    assert(start_adjustment(w, SEL_E | SEL_S, edge));
+    update_adjustment((POINT){edge.x - 40, edge.y - 12});
+    finish_adjustment(w, TRUE);
+    assert(base.width == 30 && history.used == 1 && history.total == 2);
+    assert(history.marks[0].points[0].x == 60 && text_input == field);
+    WCHAR text[16];
+    assert(GetWindowTextW(field, text, ARRAYSIZE(text)) == 4 && !wcscmp(text, L"保留输入"));
+
+    POINT inside = {selection.left + 16, selection.top + 21};
+    adjust_alt = TRUE;
+    ime_composing = TRUE;
+    if (wide_desktop) assert(!start_adjustment(w, SEL_MOVE, inside));
+    else send_edit_mouse(field, WM_LBUTTONDOWN, inside);
+    assert(!adjust_mode && text_input == field);
+    ime_composing = FALSE;
+    if (wide_desktop) assert(start_adjustment(w, SEL_MOVE, inside));
+    else send_edit_mouse(field, WM_LBUTTONDOWN, inside);
+    adjust_alt = FALSE; // Drag mode is latched even if Alt is released early.
+    assert(adjust_mode == SEL_MOVE && !drawing && text_input == field);
+    POINT moved = {inside.x + 50, inside.y};
+    if (wide_desktop) {
+        update_adjustment(moved);
+        finish_adjustment(w, TRUE);
+    } else send_edit_mouse(w, WM_LBUTTONUP, moved);
+    assert(base.width == 30 && selection.left == original.left + 50);
+    unsigned char *ink = canvas.image.bgra + (20 * base.width + 10) * 4;
+    assert(!memcmp(ink, (unsigned char[]){68, 74, 233, 255}, 4));
+    assert(history_redo(&history) && history_undo(&history) && history.total == 2);
+
+    assert(start_adjustment(w, SEL_MOVE, (POINT){selection.left + 10, selection.top + 20}));
+    Rect before_cancel = selection;
+    update_adjustment((POINT){original.left + 20, original.top + 20});
+    SendMessageW(w, WM_CANCELMODE, 0, 0);
+    assert(!adjust_mode && same_rect(selection, before_cancel) && text_input == field);
+
+    struct { HWND target; UINT msg; WPARAM key; } escapes[] = {
+        {owner, WM_HOTKEY, HOTKEY_CANCEL}, {w, WM_KEYDOWN, VK_ESCAPE},
+        {field, WM_KEYDOWN, VK_ESCAPE}, {field, WM_SYSKEYDOWN, VK_ESCAPE},
+        {toolbar.buttons[ACT_PEN], WM_KEYDOWN, VK_ESCAPE}
+    };
+    // Exercise WM_HOTKEY dispatch without acquiring the machine's Escape key.
+    BOOL originally_registered = escape_registered;
+    escape_registered = TRUE;
+    for (size_t i = 0; i < ARRAYSIZE(escapes); ++i) {
+        assert(start_adjustment(w, SEL_MOVE, (POINT){selection.left + 10, selection.top + 20}));
+        update_adjustment((POINT){original.left + 20, original.top + 20});
+        assert(!same_rect(adjust_area, before_cancel));
+        SendMessageW(escapes[i].target, escapes[i].msg, escapes[i].key, 0);
+        assert(phase == EDITING && !adjust_mode && !GetCapture());
+        assert(same_rect(selection, before_cancel) && text_input == field);
+        assert(history.used == 1 && history.total == 2);
+        if (escapes[i].msg != WM_HOTKEY) {
+            SendMessageW(escapes[i].target, escapes[i].msg, VK_ESCAPE, 1L << 30);
+            SendMessageW(escapes[i].target, escapes[i].msg == WM_SYSKEYDOWN ? WM_SYSCHAR : WM_CHAR, 27, 0);
+            assert(phase == EDITING && text_input == field);
+        }
+    }
+    escape_registered = originally_registered;
+    SendMessageW(field, WM_KEYDOWN, VK_ESCAPE, 0);
+    assert(phase == IDLE && recent.bgra == previous_recent && copies == previous_copies);
+}
+
+static void narrow_edit_test(void) {
+    release_into_editor();
+    HWND w = surfaces[0].window;
+    POINT edge = {selection.right - 1, selection.top + 18};
+    assert(start_adjustment(w, SEL_E, edge));
+    update_adjustment((POINT){edge.x - 65, edge.y});
+    finish_adjustment(w, TRUE);
+    assert(base.width == 5 && phase == EDITING);
+    if (!wide_desktop) {
+        POINT mark = {selection.left + 2, selection.top + 15};
+        tool = PEN;
+        send_edit_mouse(w, WM_LBUTTONDOWN, mark);
+        assert(drawing && !adjust_mode);
+        send_edit_mouse(w, WM_LBUTTONUP, mark);
+        assert(!drawing && history.used == 1);
+    }
+    escape_registered = TRUE;
+    SendMessageW(owner, WM_HOTKEY, HOTKEY_CANCEL, 0);
+    assert(phase == IDLE && !escape_registered && !history.used);
+}
+
 static void edit_test(void) {
     theme_test();
     render_test();
+    adjustment_test();
+    narrow_edit_test();
     recent = (Image){1, 1, malloc(4)};
     assert(recent.bgra);
     unsigned char *old = recent.bgra;
     uintptr_t old_address = (uintptr_t)old;
     release_into_editor();
     assert(recent.bgra == old && !copies);
+    toolbar_glyph_test();
+    Rect screen = frames[0].bounds;
+    HDC probe = CreateCompatibleDC(NULL);
+    void *bits;
+    BITMAPINFO info = bitmap_info(12, 12);
+    HBITMAP dib = CreateDIBSection(probe, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    assert(probe && dib);
+    HGDIOBJ prev = SelectObject(probe, dib);
+    RECT dirty = {0, 0, 12, 12};
+    int x = selection.left - screen.left, y = selection.top - screen.top;
+    assert(IntersectClipRect(probe, 0, 0, 12, 12) != ERROR && draw_preview(probe, &dirty, 0));
+    assert(GetPixel(probe, x, y) == RGB(255, 255, 255) && GetPixel(probe, x + 6, y) == RGB(0, 0, 0));
+    assert(GetPixel(probe, x + 6, y + 1) == GetPixel(surfaces[0].dc, x + 6, y + 1));
+    COLORREF outside = GetPixel(probe, x - 1, y + 1);
+    COLORREF original = GetPixel(surfaces[0].dc, x - 1, y + 1);
+    assert_shaded(outside, original);
+    paint_grips(probe, screen);
+    assert(GetPixel(probe, x, y) == RGB(255, 255, 255));
+    assert(GetPixel(probe, x + GRIP_RADIUS, y + GRIP_RADIUS) == RGB(0, 0, 0));
+    assert(!memcmp(canvas.image.bgra, base.bgra, image_bytes(base.width, base.height)));
+    SelectObject(probe, prev);
+    DeleteObject(dib);
+    DeleteDC(probe);
     assert(!IsWindowEnabled(toolbar.buttons[ACT_UNDO]) && !IsWindowEnabled(toolbar.buttons[ACT_REDO]));
     draft = (Mark){.tool = RECTANGLE, .color = palette[0], .width = 3,
                    .x = 1, .y = 1, .end_x = 14, .end_y = 14};
@@ -498,7 +830,9 @@ static void settings_caption_test(void) {
     assert(RegisterClassW(&cls));
     HWND window = CreateWindowExW(0, cls.lpszClassName, APP_TITLE, WS_OVERLAPPEDWINDOW,
         60, 60, 570, 350, NULL, NULL, instance, NULL);
-    assert(window && sg_bind_settings(window));
+    RECT content, after;
+    assert(window && GetClientRect(window, &content) && sg_bind_settings(window));
+    assert(GetClientRect(window, &after) && EqualRect(&content, &after));
     LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
     assert(!(style & (WS_MAXIMIZEBOX | WS_THICKFRAME | WS_DLGFRAME)));
     assert((style & (WS_SYSMENU | WS_MINIMIZEBOX)) == (WS_SYSMENU | WS_MINIMIZEBOX));
@@ -508,7 +842,12 @@ static void settings_caption_test(void) {
         400, 0, 46, 48, window, NULL, instance, NULL);
     HWND close = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         446, 0, 46, 48, window, NULL, instance, NULL);
-    assert(title && min && close);
+    int dpi = (int)GetDpiForWindow(window);
+    HWND toggle = CreateWindowExW(0, L"BUTTON", L"登录 Windows 时启动拾光",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        20, MulDiv(60, dpi, 96), MulDiv(320, dpi, 96), MulDiv(32, dpi, 96),
+        window, NULL, instance, NULL);
+    assert(title && min && close && toggle);
     show_settings();
     assert(settings_title == title && IsWindowVisible(window));
     RECT header, min_rect;
@@ -519,6 +858,29 @@ static void settings_caption_test(void) {
     assert(GetWindowRect(close, &close_rect));
     assert(min_rect.right - min_rect.left == close_rect.right - close_rect.left);
     assert(SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(close_rect.left + 20, close_rect.top + 20)) == HTCLIENT);
+
+    assert((GetWindowLongPtrW(toggle, GWL_STYLE) & BS_TYPEMASK) == BS_AUTOCHECKBOX);
+    assert(SendMessageW(toggle, BM_GETCHECK, 0, 0) == BST_UNCHECKED);
+    SetActiveWindow(window);
+    SetFocus(toggle);
+    SendMessageW(toggle, BM_CLICK, 0, 0);
+    assert(SendMessageW(toggle, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    HDC probe = CreateCompatibleDC(NULL);
+    RECT bounds;
+    assert(probe && GetClientRect(toggle, &bounds));
+    BITMAPINFO info = bitmap_info(bounds.right, bounds.bottom);
+    void *bits;
+    HBITMAP dib = CreateDIBSection(probe, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    assert(dib);
+    HGDIOBJ previous = SelectObject(probe, dib);
+    SendMessageW(toggle, WM_PRINTCLIENT, (WPARAM)probe, PRF_CLIENT);
+    COLORREF track = GetPixel(probe, MulDiv(15, dpi, 96), bounds.bottom / 2);
+    assert(track == ui_colors.active);
+    SelectObject(probe, previous);
+    DeleteObject(dib);
+    DeleteDC(probe);
+    EnableWindow(toggle, FALSE);
+    assert(!IsWindowEnabled(toggle) && SendMessageW(toggle, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
     MSG message;
     sg_settings_caption(0);
@@ -603,7 +965,7 @@ int main(int argc, char **argv) {
     assert(owner);
     if (!strcmp(argv[1], "save")) save_test();
     else if (!strcmp(argv[1], "hotkey")) hotkey_test();
-    else if (!strcmp(argv[1], "preview")) preview_test();
+    else if (!strcmp(argv[1], "preview")) { preview_test(); selection_preview_test(); }
     else if (!strcmp(argv[1], "replace")) replace_test();
     else if (!strcmp(argv[1], "edit")) edit_test();
     else if (!strcmp(argv[1], "save-edit")) save_editor_test();

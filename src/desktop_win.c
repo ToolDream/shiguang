@@ -6,6 +6,7 @@
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
@@ -50,15 +51,15 @@ static BOOL layout_invalid, dragging, escape_registered, preview_failed;
 static unsigned paint_depth;
 static BOOL wide_desktop;
 static POINT anchor;
-static Rect selection;
+static Rect selection, desktop_bounds, adjust_area;
+static POINT adjust_anchor;
+static int adjust_mode;
+static EditPoint mark_origin; // Fixed when the editor opens, independent of later cuts.
 static Layout layout;
 static Surface surfaces[MAX_DISPLAYS];
 static Frame frames[MAX_DISPLAYS];
-static HDC shade_dc;
-static HBITMAP shade_bitmap;
-static HGDIOBJ shade_previous;
 static Image recent, base;
-static Canvas canvas;
+static Canvas canvas, shade;
 static History history;
 static Mark draft;
 static BOOL drawing, composition_dirty, ime_composing;
@@ -75,6 +76,8 @@ static HICON small_icon, large_icon;
 static BOOL capture_active(void) { return phase == SELECTING || phase == EDITING; }
 static void editor_action(int action);
 static void begin_editor(HWND focus);
+static BOOL start_adjustment(HWND w, int mode, POINT p);
+static void capture_escape(void);
 
 static void drain_hotkeys(void) {
     MSG message;
@@ -362,6 +365,15 @@ static BOOL create_surface(HDC screen, size_t i) {
     return TRUE;
 }
 
+static BOOL open_shade(void) {
+    if (!canvas_open(&shade, &(Image){.width = 1, .height = 1})) {
+        canvas_close(&shade);
+        return FALSE;
+    }
+    memset(shade.image.bgra, 0, 4);
+    return TRUE;
+}
+
 static BOOL freeze_desktop(void) {
     if (!read_layout(&layout)) return FALSE;
     Rect extent = layout.items[0].bounds;
@@ -372,21 +384,15 @@ static BOOL freeze_desktop(void) {
         if (b.right > extent.right) extent.right = b.right;
         if (b.bottom > extent.bottom) extent.bottom = b.bottom;
     }
-    wide_desktop = (int64_t)extent.right - extent.left > INT16_MAX ||
-                   (int64_t)extent.bottom - extent.top > INT16_MAX;
+    int64_t w = (int64_t)extent.right - extent.left, h = (int64_t)extent.bottom - extent.top;
+    if (w > INT_MAX || h > INT_MAX) return FALSE;
+    desktop_bounds = extent;
+    wide_desktop = w > INT16_MAX || h > INT16_MAX;
     HDC screen = GetDC(NULL);
     if (!screen) return FALSE;
     BOOL ok = TRUE;
     for (size_t i = 0; ok && i < layout.count; ++i) ok = create_surface(screen, i);
-    if (ok) {
-        shade_dc = CreateCompatibleDC(screen);
-        BITMAPINFO info = bitmap_info(1, 1);
-        void *black;
-        shade_bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &black, NULL, 0);
-        ok = shade_dc && shade_bitmap && (shade_previous = SelectObject(shade_dc, shade_bitmap));
-        if (ok) memset(black, 0, 4);
-    }
-    ok = GdiFlush() && ok;
+    ok = GdiFlush() && ok && open_shade();
     ReleaseDC(NULL, screen);
     return ok;
 }
@@ -402,12 +408,14 @@ static void close_text(void) {
 
 static void close_overlays(void) {
     dragging = drawing = FALSE;
+    adjust_mode = 0;
     close_text();
     close_panel(&popup);
     close_panel(&toolbar);
     popup_kind = 0;
     escape_hint = (Rect){0};
     canvas_close(&canvas);
+    canvas_close(&shade);
     history_clear(&history);
     mark_clear(&draft);
     free(base.bgra);
@@ -433,12 +441,6 @@ static void close_overlays(void) {
         frames[i] = (Frame){0};
     }
     layout.count = 0;
-    if (shade_previous) SelectObject(shade_dc, shade_previous);
-    if (shade_bitmap) DeleteObject(shade_bitmap);
-    if (shade_dc) DeleteDC(shade_dc);
-    shade_previous = NULL;
-    shade_bitmap = NULL;
-    shade_dc = NULL;
 }
 
 static void preview_failure(void) {
@@ -485,18 +487,34 @@ static void invalidate_selection(Rect r) {
     }
 }
 
+static Rect visible_selection(void) {
+    return adjust_mode ? adjust_area : selection;
+}
+
+static Rect grip_rect(EditPoint p) {
+    return (Rect){p.x - GRIP_RADIUS, p.y - GRIP_RADIUS,
+                  p.x + GRIP_RADIUS + 1, p.y + GRIP_RADIUS + 1};
+}
+
+static void invalidate_grips(Rect area) {
+    EditPoint grips[SELECTION_GRIPS];
+    selection_grips(area, desktop_bounds, grips);
+    for (int i = 0; i < SELECTION_GRIPS; ++i) invalidate_selection(grip_rect(grips[i]));
+}
+
 static void position_hint(BOOL editing) {
     invalidate_selection(escape_hint);
     escape_hint = (Rect){0};
-    if (rect_empty(selection)) return;
+    Rect area = visible_selection();
+    if (rect_empty(area)) return;
     for (size_t i = 0; i < layout.count; ++i) {
         Rect b = frames[i].bounds;
-        if (selection.left < b.left || selection.left >= b.right || selection.top > b.bottom) continue;
+        if (area.left < b.left || area.left >= b.right || area.top > b.bottom) continue;
         int dpi = (int)GetDpiForWindow(surfaces[i].window);
         if (!dpi) dpi = 96;
         int w = MulDiv(editing ? 136 : 108, dpi, 96), h = MulDiv(24, dpi, 96);
         int gap = MulDiv(5, dpi, 96);
-        int x = selection.left, y = selection.top - h - gap;
+        int x = area.left, y = area.top - h - gap;
         if (b.right - b.left < w || b.bottom - b.top < h) continue;
         if (x > b.right - w) x = b.right - w;
         if (y < b.top) y = b.top + gap;
@@ -531,11 +549,73 @@ static BOOL update_selection(HWND window, LPARAM lp) {
     return TRUE;
 }
 
+static BOOL draw_selection_edges(HDC dc, Rect screen, Rect area, Rect dirty) {
+    Rect edges[4];
+    selection_edges(area, dirty, edges);
+    int64_t width = (int64_t)area.right - area.left, height = (int64_t)area.bottom - area.top;
+    if (width == 1 && height == 1) {
+        int x = area.left - screen.left, y = area.top - screen.top;
+        if (!PtVisible(dc, x, y)) return TRUE;
+        COLORREF under = GetPixel(dc, x, y);
+        // A single pixel cannot contain both colors. Contrast it with the preview.
+        return under != CLR_INVALID && SetPixelV(dc, x, y,
+            GetRValue(under) + GetGValue(under) + GetBValue(under) >= 384 ? RGB(0, 0, 0) : RGB(255, 255, 255));
+    }
+    // Anchor both brushes to the same desktop coordinates, not to each
+    // monitor's clip rect or repaint origin. Draw only the actual perimeter.
+    POINT previous;
+    if (!SetBrushOrgEx(dc, (int)(((int64_t)area.left - screen.left) & 7),
+                           (int)(((int64_t)area.top - screen.top) & 7), &previous)) return FALSE;
+    BOOL ok = TRUE;
+    for (int i = 0; i < 4 && ok; i += 2) {
+        if (rect_empty(edges[i]) && rect_empty(edges[i + 1])) continue;
+        struct { BITMAPINFOHEADER header; DWORD pixels[64]; } tile = {
+            .header = bitmap_info(8, 8).bmiHeader
+        };
+        tile.header.biHeight = 8; // Bottom-up DIB for pattern brush realization.
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x)
+                tile.pixels[(7 - y) * 8 + x] =
+                    selection_dash_white(i == 0 ? width : height, i == 0 ? x : y, i == 0 ? y : x)
+                    ? 0xffffffu : 0;
+        HBRUSH brush = CreateDIBPatternBrushPt(&tile, DIB_RGB_COLORS);
+        if (!brush) {
+            ok = FALSE;
+            break;
+        }
+        for (int j = i; j < i + 2 && ok; ++j) {
+            Rect edge = edges[j];
+            if (!rect_empty(edge)) {
+                RECT r = {edge.left - screen.left, edge.top - screen.top,
+                          edge.right - screen.left, edge.bottom - screen.top};
+                ok = FillRect(dc, &r, brush) != 0;
+            }
+        }
+        DeleteObject(brush);
+    }
+    return SetBrushOrgEx(dc, previous.x, previous.y, NULL) && ok;
+}
+
+static BOOL shade_preview(HDC dc, const RECT *dirty, Rect screen, Rect selected) {
+    const BLENDFUNCTION dim = {AC_SRC_OVER, 0, 51, 0}; // 20% black
+    int w = dirty->right - dirty->left, h = dirty->bottom - dirty->top;
+    if (rect_empty(selected))
+        return AlphaBlend(dc, dirty->left, dirty->top, w, h, shade.dc, 0, 0, 1, 1, dim);
+    RECT inside = {selected.left - screen.left, selected.top - screen.top,
+                   selected.right - screen.left, selected.bottom - screen.top};
+    if (EqualRect(&inside, dirty)) return TRUE;
+    int saved = SaveDC(dc);
+    if (!saved) return FALSE;
+    int clip = ExcludeClipRect(dc, inside.left, inside.top, inside.right, inside.bottom);
+    BOOL ok = clip != ERROR && (clip == NULLREGION ||
+        AlphaBlend(dc, dirty->left, dirty->top, w, h, shade.dc, 0, 0, 1, 1, dim));
+    return RestoreDC(dc, saved) && ok;
+}
+
 static BOOL draw_preview(HDC dc, const RECT *dirty, size_t i) {
     int x = dirty->left, y = dirty->top;
     int w = dirty->right - x, h = dirty->bottom - y;
     if (!w || !h) return TRUE;
-    const BLENDFUNCTION dim = {AC_SRC_OVER, 0, 104, 0};
     Rect b = frames[i].bounds;
     if (!BitBlt(dc, x, y, w, h, surfaces[i].dc, x, y, SRCCOPY)) {
         // A memory DC may not be compatible with a window on another adapter.
@@ -544,43 +624,58 @@ static BOOL draw_preview(HDC dc, const RECT *dirty, size_t i) {
                          &info, DIB_RGB_COLORS, SRCCOPY) <= 0) return FALSE;
     }
 
-    Rect selected = intersect_rect(selection, b);
-    if ((!dragging && !base.bgra) || rect_empty(selected))
-        return AlphaBlend(dc, x, y, w, h, shade_dc, 0, 0, 1, 1, dim);
+    Rect update = {b.left + dirty->left, b.top + dirty->top, b.left + dirty->right, b.top + dirty->bottom};
+    Rect area = dragging || base.bgra ? visible_selection() : (Rect){0};
+    Rect selected = intersect_rect(area, update);
+    // Recompose from frozen pixels on every invalidation, then darken only
+    // the dirty pixels outside the latest selection. Never touch base/canvas.
+    if (!shade_preview(dc, dirty, b, selected)) return FALSE;
+    if (rect_empty(selected)) return TRUE;
 
-    int l = selected.left - b.left, t = selected.top - b.top;
-    int r = selected.right - b.left, bot = selected.bottom - b.top;
-    int saved = SaveDC(dc);
-    if (!saved) return FALSE;
-    int clip = ExcludeClipRect(dc, l, t, r, bot);
-    BOOL shaded = clip != ERROR && (clip == NULLREGION ||
-        AlphaBlend(dc, x, y, w, h, shade_dc, 0, 0, 1, 1, dim));
-    if (!RestoreDC(dc, saved) || !shaded) return FALSE;
     if (base.bgra) {
-        if (composition_dirty) {
-            if (!canvas_render(&canvas, &base, &history, drawing ? &draft : NULL)) return FALSE;
+        // Live bounds paint on the overlay only. Allocate/re-crop once on release.
+        if (!adjust_mode && composition_dirty) {
+            if (!canvas_render(&canvas, &base, &history, drawing ? &draft : NULL,
+                (EditPoint){mark_origin.x - selection.left, mark_origin.y - selection.top})) return FALSE;
             composition_dirty = FALSE;
         }
+        int l = selected.left - b.left, t = selected.top - b.top;
+        int r = selected.right - b.left, bot = selected.bottom - b.top;
         int saved_clip = SaveDC(dc);
         if (!saved_clip) return FALSE;
-        BOOL ok = IntersectClipRect(dc, l, t, r, bot) != ERROR;
-        if (ok && !BitBlt(dc, l, t, r - l, bot - t, canvas.dc,
-                         selected.left - selection.left, selected.top - selection.top, SRCCOPY)) {
-            BITMAPINFO info = bitmap_info(base.width, base.height);
-            int drawn = StretchDIBits(dc, selection.left - b.left, selection.top - b.top,
-                base.width, base.height, 0, 0, base.width, base.height,
-                canvas.image.bgra, &info, DIB_RGB_COLORS, SRCCOPY);
-            // A dirty rectangle wholly outside the clip can draw zero scanlines.
-            ok = drawn != (int)GDI_ERROR && (drawn > 0 || r <= x || l >= x + w || bot <= y || t >= y + h);
+        int clip = IntersectClipRect(dc, l, t, r, bot);
+        BOOL ok = clip != ERROR;
+        if (ok && clip != NULLREGION) {
+            if (adjust_mode) {
+                ok = paint_marks(dc, &history, NULL, (EditPoint){mark_origin.x - b.left, mark_origin.y - b.top});
+            } else if (!BitBlt(dc, l, t, r - l, bot - t, canvas.dc,
+                               selected.left - selection.left, selected.top - selection.top, SRCCOPY)) {
+                BITMAPINFO info = bitmap_info(base.width, base.height);
+                int drawn = StretchDIBits(dc, selection.left - b.left, selection.top - b.top,
+                    base.width, base.height, 0, 0, base.width, base.height,
+                    canvas.image.bgra, &info, DIB_RGB_COLORS, SRCCOPY);
+                ok = drawn != (int)GDI_ERROR && drawn > 0;
+            }
         }
-        return RestoreDC(dc, saved_clip) && ok;
+        if (!RestoreDC(dc, saved_clip) || !ok) return FALSE;
     }
-    if (!ui_colors.high_contrast) return TRUE;
-    HBRUSH border = GetSysColorBrush(COLOR_HIGHLIGHT);
-    return (selected.left != selection.left || FillRect(dc, &(RECT){l, t, l + 1, bot}, border)) &&
-        (selected.right != selection.right || FillRect(dc, &(RECT){r - 1, t, r, bot}, border)) &&
-        (selected.top != selection.top || FillRect(dc, &(RECT){l, t, r, t + 1}, border)) &&
-        (selected.bottom != selection.bottom || FillRect(dc, &(RECT){l, bot - 1, r, bot}, border));
+    // Composite/export pixels are finalized above; the outline only touches
+    // the preview window DC, including after the selection has been locked.
+    return draw_selection_edges(dc, b, area, selected);
+}
+
+static void paint_grips(HDC dc, Rect screen) {
+    if (phase != EDITING || adjust_mode || !base.bgra) return;
+    EditPoint grips[SELECTION_GRIPS];
+    selection_grips(selection, desktop_bounds, grips);
+    for (int i = 0; i < SELECTION_GRIPS; ++i) {
+        Rect a = grip_rect(grips[i]);
+        if (rect_empty(intersect_rect(a, screen))) continue;
+        RECT r = {a.left - screen.left, a.top - screen.top, a.right - screen.left, a.bottom - screen.top};
+        FillRect(dc, &r, GetStockObject(BLACK_BRUSH));
+        InflateRect(&r, -1, -1);
+        FillRect(dc, &r, GetStockObject(WHITE_BRUSH));
+    }
 }
 
 static void paint_escape_hint(HDC dc, size_t i) {
@@ -601,8 +696,9 @@ static void paint_escape_hint(HDC dc, size_t i) {
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, ui_colors.hint_ink);
     wchar_t label[64];
+    Rect area = visible_selection();
     if (swprintf(label, ARRAYSIZE(label), base.bgra ? L"%d × %d  ·  Esc" : L"%d × %d",
-        selection.right - selection.left, selection.bottom - selection.top) > 0)
+        area.right - area.left, area.bottom - area.top) > 0)
         DrawTextW(dc, label, -1, &box, DT_VCENTER | DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
     RestoreDC(dc, saved);
     if (font) DeleteObject(font);
@@ -617,6 +713,7 @@ static void paint_overlay(HWND window, size_t i) {
         if (!dc || i >= layout.count || !draw_preview(dc, &ps.rcPaint, i)) preview_failure();
         else {
             paint_escape_hint(dc, i);
+            paint_grips(dc, frames[i].bounds);
             if (!GdiFlush()) preview_failure();
         }
     }
@@ -690,17 +787,27 @@ static LRESULT CALLBACK text_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp,
     (void)ref;
     if (msg == WM_IME_STARTCOMPOSITION) ime_composing = TRUE;
     if (msg == WM_IME_ENDCOMPOSITION) ime_composing = FALSE;
-    if (msg == WM_KEYDOWN && !ime_composing) {
-        if (wp == VK_RETURN) {
-            commit_text();
-            return 0;
-        }
-        if (wp == VK_ESCAPE) {
-            cancel_capture();
+    if (msg == WM_LBUTTONDOWN && GetKeyState(VK_MENU) < 0) {
+        POINT p;
+        if (pointer_position(w, lp, &p) &&
+            selection_hit(selection, desktop_bounds, (EditPoint){p.x, p.y}, TRUE) == SEL_MOVE) {
+            start_adjustment(GetParent(w), SEL_MOVE, p);
             return 0;
         }
     }
-    if (msg == WM_CHAR && (wp == L'\r' || wp == 27 || wp == 19)) return 0;
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wp == VK_ESCAPE) {
+        BOOL repeat = (lp & (1L << 30)) != 0;
+        if (adjust_mode || (!ime_composing && (msg == WM_KEYDOWN || repeat))) {
+            if (!repeat) capture_escape();
+            return 0;
+        }
+    }
+    if (msg == WM_KEYDOWN && !ime_composing && wp == VK_RETURN) {
+        if (!adjust_mode) commit_text();
+        return 0;
+    }
+    if (((msg == WM_CHAR || msg == WM_SYSCHAR) && wp == 27) ||
+        (msg == WM_CHAR && (wp == L'\r' || wp == 19))) return 0;
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(w, text_proc, id);
     return DefSubclassProc(w, msg, wp, lp);
 }
@@ -712,7 +819,7 @@ static void start_mark(HWND w, POINT pos) {
         UnregisterHotKey(owner, HOTKEY_CANCEL)) escape_registered = FALSE;
     UINT dpi = GetDpiForWindow(w);
     if (!dpi) dpi = 96;
-    int x = pos.x - selection.left, y = pos.y - selection.top;
+    int x = pos.x - mark_origin.x, y = pos.y - mark_origin.y;
     int width = MulDiv(tool == TEXT ? 22 : 3, (int)dpi, 96);
     draft = (Mark){.tool = tool, .color = palette[edit_color], .width = width > 0 ? width : 1,
                    .x = x, .y = y, .end_x = x, .end_y = y};
@@ -749,8 +856,8 @@ static void start_mark(HWND w, POINT pos) {
 }
 
 static BOOL move_mark(POINT pos) {
-    int x = clamp_to(pos.x, selection.left, selection.right - 1) - selection.left;
-    int y = clamp_to(pos.y, selection.top, selection.bottom - 1) - selection.top;
+    int x = clamp_to(pos.x, selection.left, selection.right - 1) - mark_origin.x;
+    int y = clamp_to(pos.y, selection.top, selection.bottom - 1) - mark_origin.y;
     if (draft.tool == CIRCLE) {
         int dx = x - draft.x, dy = y - draft.y;
         int d = abs(dx) < abs(dy) ? abs(dx) : abs(dy);
@@ -781,7 +888,7 @@ static BOOL editor_save_allowed(void) {
 }
 
 static void editor_output(BOOL save) {
-    if (drawing || !commit_text()) return;
+    if (drawing || adjust_mode || !commit_text()) return;
     if (paint_depth || !flush_overlays() || !unchanged_layout() || layout_invalid || preview_failed) {
         cancel_capture();
         return;
@@ -831,7 +938,7 @@ static void dismiss_popup(void) {
 }
 
 static void editor_action(int action) {
-    if (phase != EDITING || drawing || !commit_text()) return;
+    if (phase != EDITING || drawing || adjust_mode || !commit_text()) return;
     if (action == ACT_SHAPES || action == ACT_COLOR) {
         int prior = popup_kind;
         dismiss_popup();
@@ -872,6 +979,120 @@ static void editor_action(int action) {
     sync_tools();
 }
 
+static BOOL place_toolbar(Rect area) {
+    Rect screens[MAX_DISPLAYS];
+    for (size_t i = 0; i < layout.count; ++i) screens[i] = frames[i].bounds;
+    size_t index = editor_screen(area, screens, layout.count);
+    if (index == layout.count) return FALSE;
+    UINT dpi = GetDpiForWindow(surfaces[index].window);
+    if (!dpi) dpi = 96;
+    int gap = MulDiv(8, (int)dpi, 96);
+    Dock dock = editor_dock(area, screens[index], MulDiv(44, (int)dpi, 96), gap, BAR_BUTTONS);
+    if (!dock.cell) return FALSE;
+    if (toolbar.window && (!same_rect(bar_dock.bounds, dock.bounds) ||
+        bar_dock.cell != dock.cell || bar_dock.cols != dock.cols) && !move_panel(&toolbar, bar_dock, dock)) {
+        move_panel(&toolbar, dock, bar_dock);
+        return FALSE;
+    }
+    bar_monitor = index;
+    bar_screen = screens[index];
+    editor_gap = gap;
+    bar_dock = dock;
+    return TRUE;
+}
+
+static int adjustment_at(POINT p) {
+    return selection_hit(selection, desktop_bounds, (EditPoint){p.x, p.y}, GetKeyState(VK_MENU) < 0);
+}
+
+static HCURSOR adjustment_cursor(int mode) {
+    LPCWSTR id = IDC_CROSS;
+    switch (mode) {
+    case SEL_MOVE: id = IDC_SIZEALL; break;
+    case SEL_N | SEL_W:
+    case SEL_S | SEL_E: id = IDC_SIZENWSE; break;
+    case SEL_N | SEL_E:
+    case SEL_S | SEL_W: id = IDC_SIZENESW; break;
+    case SEL_N:
+    case SEL_S: id = IDC_SIZENS; break;
+    case SEL_E:
+    case SEL_W: id = IDC_SIZEWE; break;
+    }
+    return LoadCursorW(NULL, id);
+}
+
+static int active_adjustment_direction(void) {
+    int mode = adjust_mode;
+    if (((mode & SEL_W) && adjust_area.left == selection.right) ||
+        ((mode & SEL_E) && adjust_area.right == selection.left)) mode ^= SEL_W | SEL_E;
+    if (((mode & SEL_N) && adjust_area.top == selection.bottom) ||
+        ((mode & SEL_S) && adjust_area.bottom == selection.top)) mode ^= SEL_N | SEL_S;
+    return mode;
+}
+
+static BOOL start_adjustment(HWND w, int mode, POINT p) {
+    // Do not steal IME focus or commit a pending text edit (which would drop redo).
+    if (phase != EDITING || !mode || drawing || adjust_mode || ime_composing) return FALSE;
+    SetCapture(w);
+    if (phase != EDITING || GetCapture() != w) return FALSE;
+    adjust_anchor = p;
+    adjust_area = selection;
+    adjust_mode = mode;
+    invalidate_grips(selection);
+    SetCursor(adjustment_cursor(mode));
+    return TRUE;
+}
+
+static void update_adjustment(POINT p) {
+    Rect next = selection_adjust(selection, desktop_bounds, adjust_mode,
+        (int64_t)p.x - adjust_anchor.x, (int64_t)p.y - adjust_anchor.y);
+    if (!same_rect(next, adjust_area) &&
+        image_bytes((int64_t)next.right - next.left, (int64_t)next.bottom - next.top) &&
+        place_toolbar(next)) {
+        invalidate_selection(adjust_area);
+        adjust_area = next;
+        invalidate_selection(adjust_area);
+        position_hint(TRUE);
+    }
+    SetCursor(adjustment_cursor(active_adjustment_direction()));
+}
+
+static void finish_adjustment(HWND w, BOOL apply) {
+    if (!adjust_mode) return;
+    Rect next = adjust_area;
+    adjust_mode = 0;
+    if (apply && !same_rect(next, selection)) {
+        Image new_base = {0};
+        Canvas new_canvas = {0};
+        if (crop_frozen(next, frames, layout.count, &new_base) == CROP_OK &&
+            canvas_open(&new_canvas, &new_base) &&
+            canvas_render(&new_canvas, &new_base, &history, NULL,
+                (EditPoint){mark_origin.x - next.left, mark_origin.y - next.top})) {
+            canvas_close(&canvas);
+            free(base.bgra);
+            canvas = new_canvas;
+            base = new_base;
+            selection = next;
+            composition_dirty = FALSE;
+        } else {
+            canvas_close(&new_canvas);
+            free(new_base.bgra);
+            notice(L"无法调整截图区域，原选区与标注仍保留。");
+        }
+    }
+    if (!same_rect(next, selection)) place_toolbar(selection);
+    invalidate_selection(next);
+    invalidate_selection(selection);
+    position_hint(TRUE);
+    invalidate_grips(selection);
+    if (w && GetCapture() == w) ReleaseCapture();
+}
+
+static void capture_escape(void) {
+    if (phase == EDITING && adjust_mode) finish_adjustment(GetCapture(), FALSE);
+    else cancel_capture();
+}
+
 static void begin_editor(HWND focus) {
     CropResult status = crop_frozen(selection, frames, layout.count, &base);
     if (status != CROP_OK) {
@@ -884,19 +1105,11 @@ static void begin_editor(HWND focus) {
         cancel_capture();
         return;
     }
-    Rect screens[MAX_DISPLAYS];
-    for (size_t i = 0; i < layout.count; ++i) screens[i] = frames[i].bounds;
-    size_t screen_index = editor_screen(selection, screens, layout.count);
-    if (screen_index == layout.count) {
+    mark_origin = (EditPoint){selection.left, selection.top};
+    if (!place_toolbar(selection)) {
         cancel_capture();
         return;
     }
-    bar_monitor = screen_index;
-    bar_screen = screens[screen_index];
-    UINT dpi = GetDpiForWindow(surfaces[screen_index].window);
-    if (!dpi) dpi = 96;
-    editor_gap = MulDiv(8, (int)dpi, 96);
-    bar_dock = editor_dock(selection, bar_screen, MulDiv(44, (int)dpi, 96), editor_gap, BAR_BUTTONS);
     drawing = dragging = FALSE;
     tool = shape = RECTANGLE;
     edit_color = 0;
@@ -909,6 +1122,7 @@ static void begin_editor(HWND focus) {
     }
     position_hint(TRUE);
     edit_changed();
+    invalidate_grips(selection);
     if (!flush_overlays() ||
         !open_panel(&toolbar, instance, surfaces[bar_monitor].window, bar_dock, ACT_SHAPES, BAR_BUTTONS, editor_action)) {
         preview_failure();
@@ -950,13 +1164,31 @@ static LRESULT CALLBACK overlay_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (phase == EDITING) {
         POINT p;
         switch (msg) {
+        case WM_MOUSEACTIVATE:
+            if (text_input && HIWORD(lp) == WM_LBUTTONDOWN &&
+                GetCursorPos(&p) && adjustment_at(p)) return MA_NOACTIVATE;
+            break;
+        case WM_SETCURSOR:
+            if ((HWND)wp != w || LOWORD(lp) != HTCLIENT) break;
+            SetCursor(adjustment_cursor(adjust_mode ? active_adjustment_direction() :
+                !drawing && GetCursorPos(&p) ? adjustment_at(p) : 0));
+            return TRUE;
         case WM_LBUTTONDOWN:
             dismiss_popup();
-            if (!drawing && pointer_position(w, lp, &p)) start_mark(w, p);
+            if (!drawing && !adjust_mode && pointer_position(w, lp, &p)) {
+                int mode = adjustment_at(p);
+                if (mode) start_adjustment(w, mode, p);
+                else start_mark(w, p);
+            }
             return 0;
         case WM_MOUSEMOVE:
         case WM_LBUTTONUP:
-            if (drawing) {
+            if (adjust_mode) {
+                if (pointer_position(w, lp, &p)) {
+                    update_adjustment(p);
+                    if (msg == WM_LBUTTONUP) finish_adjustment(w, TRUE);
+                } else finish_adjustment(w, FALSE);
+            } else if (drawing) {
                 if (!pointer_position(w, lp, &p) || !move_mark(p)) {
                     discard_draft();
                     if (GetCapture() == w) ReleaseCapture();
@@ -971,15 +1203,22 @@ static LRESULT CALLBACK overlay_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_CANCELMODE:
         case WM_CAPTURECHANGED:
-            if (drawing) {
+            if (adjust_mode) finish_adjustment(w, FALSE);
+            else if (drawing) {
                 discard_draft();
                 if (msg == WM_CANCELMODE && GetCapture() == w) ReleaseCapture();
             }
             return 0;
+        case WM_CHAR:
+        case WM_SYSCHAR:
+            if (wp == 27) return 0;
+            break;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
-            if (wp == VK_ESCAPE) cancel_capture();
-            else if (msg == WM_KEYDOWN && !text_input && !(lp & (1L << 30))) {
+            if (wp == VK_ESCAPE) {
+                // A held key must not cancel the editor after it rolled back a drag.
+                if (!(lp & (1L << 30))) capture_escape();
+            } else if (msg == WM_KEYDOWN && !text_input && !(lp & (1L << 30))) {
                 uint32_t chord = key_chord((unsigned)wp, FALSE);
                 if (chord == VK_RETURN) editor_action(ACT_COPY);
                 else if (chord == 0x0253u) editor_action(ACT_SAVE);
@@ -1082,132 +1321,163 @@ enum SettingsFace {
     SETTINGS_FEEDBACK, SETTINGS_SWITCH, SETTINGS_KEYCAP, SETTINGS_LABEL, SETTINGS_MUTED
 };
 static HWND settings_title;
+static const WCHAR settings_face_key[] = L"Shiguang.SettingsFace";
+
+static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
+    RECT r;
+    if (!GetClientRect(w, &r)) return;
+    int saved = SaveDC(dc);
+    if (!saved) return;
+    const UiPalette *c = &ui_colors;
+    BOOL hc = c->high_contrast;
+    int dpi = (int)GetDpiForWindow(w);
+    POINT p;
+    BOOL hot = GetCursorPos(&p) && WindowFromPoint(p) == w;
+    BOOL pressed = (SendMessageW(w, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
+    BOOL disabled = !IsWindowEnabled(w);
+    COLORREF ink = disabled ? c->muted : c->ink;
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SetDCBrushColor(dc, c->surface);
+    FillRect(dc, &r, GetStockObject(DC_BRUSH));
+    if (id == SETTINGS_CHANGE || id == SETTINGS_QUIT || id == SETTINGS_KEYCAP) {
+        BOOL primary = id == SETTINGS_CHANGE;
+        BOOL system_highlight = hc && !disabled && id != SETTINGS_KEYCAP && (hot || pressed);
+        UiFace face = primary ? ui_primary_face(c, pressed || system_highlight) :
+            (UiFace){system_highlight ? c->active :
+                         !hc && (id == SETTINGS_KEYCAP || (hot && id == SETTINGS_QUIT))
+                             ? c->hover : c->surface,
+                     system_highlight ? c->active_ink : ink};
+        if (disabled) face = (UiFace){c->surface, c->muted};
+        SetDCBrushColor(dc, face.fill);
+        SetDCPenColor(dc, primary && (hot || pressed) && !hc && !disabled ? c->focus : c->edge);
+        int radius = MulDiv(14, dpi, 96);
+        RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+        ink = face.ink;
+    }
+    if (id == SETTINGS_MIN || id == SETTINGS_CLOSE) {
+        if (hot || pressed) {
+            SetDCBrushColor(dc, hc ? c->active : id == SETTINGS_CLOSE ? RGB(192, 38, 49) : c->hover);
+            FillRect(dc, &r, GetStockObject(DC_BRUSH));
+            if (hc) ink = c->active_ink;
+            else if (id == SETTINGS_CLOSE) ink = RGB(255, 255, 255);
+        }
+        SetDCPenColor(dc, ink);
+        int x = r.right / 2, y = r.bottom / 2, a = MulDiv(5, dpi, 96);
+        if (id == SETTINGS_MIN)
+            Polyline(dc, (POINT[]){{x - a, y}, {x + a + 1, y}}, 2);
+        else {
+            Polyline(dc, (POINT[]){{x-a,y-a},{x+a+1,y+a+1}}, 2);
+            Polyline(dc, (POINT[]){{x+a,y-a},{x-a-1,y+a+1}}, 2);
+        }
+    } else {
+        UINT align = DT_CENTER;
+        if (id == SETTINGS_TITLE) {
+            int inset = MulDiv(18, dpi, 96), side = MulDiv(21, dpi, 96);
+            DrawIconEx(dc, inset, (r.bottom-side)/2, small_icon, side, side, 0, NULL, DI_NORMAL);
+            r.left = inset + side + MulDiv(10, dpi, 96);
+            align = DT_LEFT;
+        } else if (id == SETTINGS_SWITCH) {
+            BOOL on = SendMessageW(w, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            int h = MulDiv(18, dpi, 96), wide = MulDiv(34, dpi, 96);
+            int x = MulDiv(2, dpi, 96), y = (r.bottom-h)/2, pad = MulDiv(3, dpi, 96);
+            BOOL enabled_on = on && !disabled;
+            COLORREF track = enabled_on ? c->active : hc ? c->surface : c->hover;
+            COLORREF thumb_ink = enabled_on ? (hc ? c->active_ink : c->focus)
+                : disabled || !hc ? c->muted : c->ink;
+            SetDCBrushColor(dc, track);
+            SetDCPenColor(dc, disabled ? c->muted : enabled_on && !hc ? c->focus : c->edge);
+            RoundRect(dc, x, y, x+wide, y+h, h, h);
+            SetDCBrushColor(dc, thumb_ink);
+            SetDCPenColor(dc, thumb_ink);
+            int thumb = on ? x+wide-h+pad : x+pad;
+            Ellipse(dc, thumb, y+pad, thumb+h-2*pad, y+h-pad);
+            r.left = x+wide+MulDiv(9, dpi, 96);
+            align = DT_LEFT;
+        } else if (id == SETTINGS_FEEDBACK || id == SETTINGS_LABEL || id == SETTINGS_MUTED) {
+            if (id == SETTINGS_FEEDBACK) ink = c->warning;
+            if (id == SETTINGS_MUTED && !hc) ink = c->muted;
+            align = DT_LEFT;
+        }
+        HFONT font = (HFONT)SendMessageW(w, WM_GETFONT, 0, 0);
+        if (font) SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, ink);
+        wchar_t caption[192];
+        int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
+        if (n) DrawTextW(dc, caption, n, &r, DT_NOPREFIX |
+            (id == SETTINGS_FEEDBACK ? DT_WORDBREAK : DT_SINGLELINE | DT_VCENTER | align | DT_END_ELLIPSIS));
+        else if (r.bottom <= MulDiv(2, dpi, 96)) {
+            SetDCBrushColor(dc, c->edge);
+            FillRect(dc, &r, GetStockObject(DC_BRUSH));
+        }
+    }
+    if (GetFocus() == w && !(SendMessageW(w, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
+        GetClientRect(w, &r);
+        InflateRect(&r, -2, -2);
+        if (hc) DrawFocusRect(dc, &r);
+        else {
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            SetDCPenColor(dc, c->focus);
+            RoundRect(dc, r.left, r.top, r.right, r.bottom, 8, 8);
+        }
+    }
+    RestoreDC(dc, saved);
+}
 
 static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp,
                                           UINT_PTR id, DWORD_PTR ref) {
     if (msg == WM_NCDESTROY) {
         if (ref == SETTINGS_TITLE) settings_title = NULL;
+        RemovePropW(w, settings_face_key);
         RemoveWindowSubclass(w, settings_face_proc, id);
     }
-    id = ref;
-    if (id == SETTINGS_TITLE && msg == WM_NCHITTEST) return HTTRANSPARENT;
-    if (msg == WM_MOUSEMOVE && id <= SETTINGS_CLOSE) {
+    if (ref == SETTINGS_TITLE && msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps = {0};
+        HDC dc = BeginPaint(w, &ps);
+        if (dc) paint_settings_face(w, dc, ref);
+        EndPaint(w, &ps);
+        return 0;
+    }
+    if (msg == WM_PRINTCLIENT) {
+        paint_settings_face(w, (HDC)wp, ref);
+        return 0;
+    }
+    BOOL button = ref <= SETTINGS_CLOSE || ref == SETTINGS_SWITCH;
+    if (button && msg == WM_MOUSEMOVE) {
         TRACKMOUSEEVENT track = {.cbSize = sizeof track, .dwFlags = TME_LEAVE, .hwndTrack = w};
         TrackMouseEvent(&track);
-        InvalidateRect(w, NULL, FALSE);
     }
-    if (msg == WM_MOUSELEAVE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS || msg == WM_UPDATEUISTATE)
-        InvalidateRect(w, NULL, FALSE);
-    if (msg != WM_PAINT) return DefSubclassProc(w, msg, wp, lp);
+    LRESULT result = DefSubclassProc(w, msg, wp, lp);
+    // The stock Button class can repaint directly during state changes. Keep
+    // its auto-check/accessibility semantics, but restore our face immediately.
+    if (button && (msg == BM_SETCHECK || msg == BM_SETSTATE || msg == BM_CLICK || msg == WM_ENABLE ||
+        msg == WM_SETFOCUS || msg == WM_KILLFOCUS || msg == WM_UPDATEUISTATE ||
+        msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_CANCELMODE ||
+        msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CAPTURECHANGED ||
+        msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE))
+        RedrawWindow(w, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    return result;
+}
 
-    const UiPalette *c = &ui_colors;
-    BOOL hc = c->high_contrast;
-    // The same paint path uses explicit system colors in high contrast; Leaf
-    // still owns the native control, its keyboard handling, and its semantics.
-    PAINTSTRUCT ps = {0};
-    HDC dc = BeginPaint(w, &ps);
-    if (dc) {
-        RECT r;
-        GetClientRect(w, &r);
-        int saved = SaveDC(dc);
-        if (saved) {
-            int dpi = (int)GetDpiForWindow(w);
-            POINT p;
-            BOOL hot = GetCursorPos(&p) && WindowFromPoint(p) == w;
-            BOOL pressed = (SendMessageW(w, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
-            BOOL disabled = !IsWindowEnabled(w);
-            COLORREF ink = disabled ? c->muted : c->ink;
-            SelectObject(dc, GetStockObject(DC_BRUSH));
-            SelectObject(dc, GetStockObject(DC_PEN));
-            SetDCBrushColor(dc, c->surface);
-            FillRect(dc, &r, GetStockObject(DC_BRUSH));
-            if (id == SETTINGS_CHANGE || id == SETTINGS_QUIT || id == SETTINGS_KEYCAP) {
-                BOOL primary = id == SETTINGS_CHANGE;
-                BOOL system_highlight = hc && !disabled && id != SETTINGS_KEYCAP && (hot || pressed);
-                UiFace face = primary ? ui_primary_face(c, pressed || system_highlight) :
-                    (UiFace){system_highlight ? c->active :
-                                 !hc && (id == SETTINGS_KEYCAP || (hot && id == SETTINGS_QUIT))
-                                     ? c->hover : c->surface,
-                             system_highlight ? c->active_ink : ink};
-                if (disabled) face = (UiFace){c->surface, c->muted};
-                SetDCBrushColor(dc, face.fill);
-                SetDCPenColor(dc, primary && (hot || pressed) && !hc && !disabled ? c->focus : c->edge);
-                int radius = MulDiv(14, dpi, 96);
-                RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
-                ink = face.ink;
+static LRESULT CALLBACK settings_draw_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp,
+                                            UINT_PTR id, DWORD_PTR ref) {
+    (void)ref;
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(w, settings_draw_proc, id);
+    if (msg == WM_NOTIFY && lp) {
+        const NMHDR *note = (const NMHDR *)lp;
+        if (note->code == NM_CUSTOMDRAW) {
+            const NMCUSTOMDRAW *draw = (const NMCUSTOMDRAW *)lp;
+            DWORD_PTR face = (DWORD_PTR)GetPropW(note->hwndFrom, settings_face_key);
+            if (face && draw->dwDrawStage == CDDS_PREPAINT) {
+                paint_settings_face(note->hwndFrom, draw->hdc, face);
+                return CDRF_SKIPDEFAULT;
             }
-            if (id == SETTINGS_MIN || id == SETTINGS_CLOSE) {
-                if (hot || pressed) {
-                    SetDCBrushColor(dc, hc ? c->active : id == SETTINGS_CLOSE ? RGB(192, 38, 49) : c->hover);
-                    FillRect(dc, &r, GetStockObject(DC_BRUSH));
-                    if (hc) ink = c->active_ink;
-                    else if (id == SETTINGS_CLOSE) ink = RGB(255, 255, 255);
-                }
-                SetDCPenColor(dc, ink);
-                int x = r.right / 2, y = r.bottom / 2, a = MulDiv(5, dpi, 96);
-                if (id == SETTINGS_MIN)
-                    Polyline(dc, (POINT[]){{x - a, y}, {x + a + 1, y}}, 2);
-                else {
-                    Polyline(dc, (POINT[]){{x-a,y-a},{x+a+1,y+a+1}}, 2);
-                    Polyline(dc, (POINT[]){{x+a,y-a},{x-a-1,y+a+1}}, 2);
-                }
-            } else {
-                UINT align = DT_CENTER;
-                if (id == SETTINGS_TITLE) {
-                    int inset = MulDiv(18, dpi, 96), side = MulDiv(21, dpi, 96);
-                    DrawIconEx(dc, inset, (r.bottom-side)/2, small_icon, side, side, 0, NULL, DI_NORMAL);
-                    r.left = inset + side + MulDiv(10, dpi, 96);
-                    align = DT_LEFT;
-                } else if (id == SETTINGS_SWITCH) {
-                    BOOL on = SendMessageW(w, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                    int h = MulDiv(18, dpi, 96), wide = MulDiv(34, dpi, 96);
-                    int x = MulDiv(2, dpi, 96), y = (r.bottom-h)/2, pad = MulDiv(3, dpi, 96);
-                    BOOL enabled_on = on && !disabled;
-                    COLORREF track = enabled_on ? c->active : hc ? c->surface : c->hover;
-                    COLORREF thumb_ink = enabled_on ? (hc ? c->active_ink : c->focus)
-                        : disabled || !hc ? c->muted : c->ink;
-                    SetDCBrushColor(dc, track);
-                    SetDCPenColor(dc, disabled ? c->muted : enabled_on && !hc ? c->focus : c->edge);
-                    RoundRect(dc, x, y, x+wide, y+h, h, h);
-                    SetDCBrushColor(dc, thumb_ink);
-                    SetDCPenColor(dc, thumb_ink);
-                    int thumb = on ? x+wide-h+pad : x+pad;
-                    Ellipse(dc, thumb, y+pad, thumb+h-2*pad, y+h-pad);
-                    r.left = x+wide+MulDiv(9, dpi, 96);
-                    align = DT_LEFT;
-                } else if (id == SETTINGS_FEEDBACK || id == SETTINGS_LABEL || id == SETTINGS_MUTED) {
-                    if (id == SETTINGS_FEEDBACK) ink = c->warning;
-                    if (id == SETTINGS_MUTED && !hc) ink = c->muted;
-                    align = DT_LEFT;
-                }
-                HFONT font = (HFONT)SendMessageW(w, WM_GETFONT, 0, 0);
-                if (font) SelectObject(dc, font);
-                SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, ink);
-                wchar_t caption[192];
-                int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
-                if (n) DrawTextW(dc, caption, n, &r,
-                    DT_SINGLELINE | DT_VCENTER | align | DT_NOPREFIX | DT_END_ELLIPSIS);
-                else if (r.bottom <= MulDiv(2, dpi, 96)) {
-                    SetDCBrushColor(dc, c->edge);
-                    FillRect(dc, &r, GetStockObject(DC_BRUSH));
-                }
-            }
-            if (GetFocus() == w && !(SendMessageW(w, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
-                GetClientRect(w, &r);
-                InflateRect(&r, -2, -2);
-                if (hc) DrawFocusRect(dc, &r);
-                else {
-                    SelectObject(dc, GetStockObject(NULL_BRUSH));
-                    SetDCPenColor(dc, c->focus);
-                    RoundRect(dc, r.left, r.top, r.right, r.bottom, 8, 8);
-                }
-            }
-            RestoreDC(dc, saved);
         }
     }
-    EndPaint(w, &ps);
-    return 0;
+    return DefSubclassProc(w, msg, wp, lp);
 }
 
 static BOOL CALLBACK style_settings_controls(HWND w, LPARAM unused) {
@@ -1240,7 +1510,10 @@ static BOOL CALLBACK style_settings_controls(HWND w, LPARAM unused) {
                  !wcsncmp(label, L"请按", 2)) face = SETTINGS_LABEL;
         else face = SETTINGS_MUTED;
     }
-    if (face) SetWindowSubclass(w, settings_face_proc, 1, face);
+    if (face && SetWindowSubclass(w, settings_face_proc, 1, face) &&
+        (face <= SETTINGS_CLOSE || face == SETTINGS_SWITCH) &&
+        SetPropW(w, settings_face_key, (HANDLE)face))
+        SetWindowSubclass(GetParent(w), settings_draw_proc, 1, 0);
     return TRUE;
 }
 
@@ -1298,11 +1571,14 @@ int sg_bind_settings(HWND w) {
     // Win32 shows a disabled maximize button beside an enabled minimize button.
     // Use two native Button children in the caption instead, retaining system commands.
     LONG_PTR style = GetWindowLongPtrW(w, GWL_STYLE);
+    DWORD border_style = (DWORD)((style & ~(WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX)) | WS_BORDER);
+    RECT frame;
+    if (!GetClientRect(w, &frame) || !AdjustWindowRectExForDpi(&frame, border_style, FALSE,
+        (DWORD)GetWindowLongPtrW(w, GWL_EXSTYLE), GetDpiForWindow(w))) return 0;
     SetLastError(0);
-    if (!SetWindowLongPtrW(w, GWL_STYLE, (style & ~(WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX)) | WS_BORDER)
-        && GetLastError()) return 0;
-    if (!SetWindowPos(w, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
-                      SWP_NOZORDER | SWP_NOACTIVATE)) return 0;
+    if (!SetWindowLongPtrW(w, GWL_STYLE, border_style) && GetLastError()) return 0;
+    if (!SetWindowPos(w, NULL, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
+                      SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) return 0;
     DWORD rounded = 2; // DWMWCP_ROUND; on older Windows this preference is ignored.
     DwmSetWindowAttribute(w, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &rounded, sizeof rounded);
     SendMessageW(w, WM_SETICON, ICON_SMALL, (LPARAM)small_icon);
@@ -1358,7 +1634,7 @@ static LRESULT CALLBACK owner_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0; // Leaf's post-dispatch hook handles the latched failure.
     case WM_HOTKEY:
         if (escape_registered && wp == HOTKEY_CANCEL) {
-            cancel_capture();
+            capture_escape();
         } else if (active_hotkey && wp == (WPARAM)active_hotkey) {
             if (recording_hook && settings && GetForegroundWindow() == settings) return 0;
             if (phase == EDITING && shortcut == 0x0253u) {

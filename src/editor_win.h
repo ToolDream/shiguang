@@ -17,7 +17,8 @@ typedef struct {
 } Canvas;
 int canvas_open(Canvas *c, const Image *base);
 void canvas_close(Canvas *c);
-int canvas_render(Canvas *c, const Image *base, const History *h, const Mark *draft);
+BOOL paint_marks(HDC dc, const History *h, const Mark *draft, EditPoint origin);
+int canvas_render(Canvas *c, const Image *base, const History *h, const Mark *draft, EditPoint origin);
 HFONT mark_font(int height);
 
 enum Action {
@@ -36,6 +37,7 @@ typedef struct {
 } Panel;
 BOOL register_panel(HINSTANCE instance);
 BOOL open_panel(Panel *p, HINSTANCE instance, HWND owner, Dock d, int first, int count, void (*click)(int));
+BOOL move_panel(Panel *p, Dock from, Dock to);
 void close_panel(Panel *p);
 void update_panel(Panel *p, Tool tool, Tool shape, int color, BOOL undo, BOOL redo);
 HICON shiguang_icon(int size);

@@ -45,7 +45,10 @@ proc shortcutFeedback*(outcome: cint, active: uint32): string =
   of 3: "新组合键无效，" & retained
   else: "当前无法更改，" & retained
 
-const settingsTitle* = "拾光截图 / 设置"
+const
+  settingsTitle* = "拾光截图 / 设置"
+  settingsWidth* = 574
+  settingsHeight* = 400
 
 proc settingsView*(chord: uint32, recording: bool, status: string, trayReady: bool,
                    toggleRecording, quit: Callback, minimize: Callback = nil,
@@ -62,7 +65,12 @@ proc settingsView*(chord: uint32, recording: bool, status: string, trayReady: bo
     of 1: "已注册，实际启动由 Windows 设置或策略决定"
     of 2: "已有其他路径的同名启动项，未改动"
     else: "无法读取启动项状态"
-  let startupDetail = (if startupError: "无法更新启动项。当前：" else: "") & startupStatus
+  let startupFeedback =
+    if startupError or startup > 1:
+      @[text((if startupError: "无法更新启动项。当前：" else: "") & startupStatus,
+        key = "startup-status", styles = style({"width": "full", "height": "36"}))]
+    else: @[]
+  let actionRow = style({"width": "full", "height": "44", "justify": "between", "align": "center"})
   let contentButton = style({"width": "108", "height": "40"})
   let captionButton = style({"width": "46", "height": "48"})
   column(@[
@@ -73,22 +81,23 @@ proc settingsView*(chord: uint32, recording: bool, status: string, trayReady: bo
     ], key = "caption-row", styles = style({"width": "full", "height": "48", "align": "center"})),
     standard.separator(key = "caption-divider"),
     column(@[
-      text("区域截图快捷键", key = "heading", variant = "primary"),
-      standard.cardDescription("按下当前组合键，即可开始框选。", key = "description"),
+      text("区域截图快捷键", key = "heading", variant = "primary", styles = style({"height": "28"})),
+      text("按下当前组合键，即可开始框选。", key = "description", styles = style({"height": "20"})),
       row(@[
         row(entry, key = "caps", styles = style({"gap": "7", "align": "center"})),
         leaf.button(changeLabel, onClick = toggleRecording, key = "change", styles = contentButton)
-      ], key = "shortcut", styles = style({"width": "full", "height": "48",
-        "justify": "between", "align": "center"})),
-      standard.fieldError(if status.len == 0: " " else: "ⓘ  " & status, key = "feedback"),
+      ], key = "shortcut", styles = actionRow),
+      text(if status.len == 0: "" else: "ⓘ  " & status, key = "feedback",
+        styles = style({"width": "full", "height": "22"})),
       standard.separator(key = "startup-divider"),
-      standard.switch("登录 Windows 时启动拾光", checked = startup == 1,
-        key = "startup", disabled = startup > 1, onChange = onStartup),
-      standard.cardDescription(startupDetail, key = "startup-status"),
+      # Use the native check state; the app is the sole visual owner of the switch.
+      leaf.switch("登录 Windows 时启动拾光", checked = startup == 1, key = "startup",
+        disabled = startup > 1, onChange = onStartup, styles = style({"width": "full", "height": "32"}))
+    ] & startupFeedback & @[
       standard.separator(key = "divider"),
       row(@[
         standard.cardDescription(trayLabel, key = "tray"),
         leaf.button("退出拾光", key = "quit", onClick = quit, styles = contentButton)
-      ], key = "footer", styles = style({"width": "full", "justify": "between", "align": "center"}))
-    ], key = "body", styles = style({"padding": "28", "gap": "12", "width": "full"}))
+      ], key = "footer", styles = actionRow)
+    ], key = "body", styles = style({"padding": "28", "gap": "8", "width": "full"}))
   ], key = "settings", styles = style({"width": "full", "height": "full"}))

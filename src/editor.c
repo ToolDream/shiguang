@@ -130,3 +130,112 @@ uint32_t decode_hotkey(uint32_t saved) {
     if ((saved & HOTKEY_TAG) && valid_hotkey(saved & ~HOTKEY_TAG)) return saved & ~HOTKEY_TAG;
     return HOTKEY_DEFAULT;
 }
+
+void selection_edges(Rect area, Rect clip, Rect edges[4]) {
+    if (rect_empty(area)) {
+        for (int i = 0; i < 4; ++i) edges[i] = (Rect){0};
+        return;
+    }
+    // The inset 1px outline survives at monitor edges; never double-paint corners.
+    int top_end = area.top + 1;
+    int bottom_start = max(top_end, area.bottom - 1);
+    int left_end = area.left + 1;
+    int right_start = max(left_end, area.right - 1);
+    edges[0] = intersect_rect(clip, (Rect){area.left, area.top, area.right, top_end});
+    edges[1] = intersect_rect(clip, (Rect){area.left, bottom_start, area.right, area.bottom});
+    edges[2] = intersect_rect(clip, (Rect){area.left, top_end, left_end, bottom_start});
+    edges[3] = intersect_rect(clip, (Rect){right_start, top_end, area.right, bottom_start});
+}
+
+static const int grip_modes[SELECTION_GRIPS] = {
+    SEL_N | SEL_W, SEL_N, SEL_N | SEL_E, SEL_E, SEL_S | SEL_E, SEL_S, SEL_S | SEL_W, SEL_W
+};
+
+static void grip_axis(int lo, int hi, int desk_lo, int desk_hi, int out[3]) {
+    int64_t mid = lo + ((int64_t)hi - 1 - lo) / 2;
+    int64_t start = lo, end = hi - 1;
+    const int gap = 2 * GRIP_RADIUS + 2;
+    // Make the three hit targets distinct on short edges, including at the
+    // desktop boundary. Do not change the ROI to make room for decorations.
+    if (((int64_t)desk_hi - desk_lo) >= 2 * gap + 1 && (mid - start < gap || end - mid < gap)) {
+        mid = clamp((int)mid, desk_lo + gap, desk_hi - 1 - gap);
+        start = mid - gap;
+        end = mid + gap;
+    }
+    out[0] = (int)start;
+    out[1] = (int)mid;
+    out[2] = (int)end;
+}
+
+void selection_grips(Rect area, Rect desk, EditPoint points[SELECTION_GRIPS]) {
+    int x[3], y[3];
+    grip_axis(area.left, area.right, desk.left, desk.right, x);
+    grip_axis(area.top, area.bottom, desk.top, desk.bottom, y);
+    for (int i = 0; i < SELECTION_GRIPS; ++i) {
+        int mode = grip_modes[i];
+        points[i] = (EditPoint){x[mode & SEL_W ? 0 : mode & SEL_E ? 2 : 1],
+                                y[mode & SEL_N ? 0 : mode & SEL_S ? 2 : 1]};
+    }
+}
+
+int selection_hit(Rect area, Rect desk, EditPoint at, int alt) {
+    if (rect_empty(area)) return 0;
+    int in_x = at.x >= area.left && at.x < area.right;
+    int in_y = at.y >= area.top && at.y < area.bottom;
+    const int slop = 2;
+    int64_t width = (int64_t)area.right - area.left, height = (int64_t)area.bottom - area.top;
+    int narrow_x = width <= 2 * (slop + 1), narrow_y = height <= 2 * (slop + 1);
+    if (in_x && in_y) {
+        if (alt) return SEL_MOVE;
+        // When the edge bands consume an axis, reserve its center pixels
+        // even if a grip is pushed inward at the desktop boundary.
+        if ((narrow_x || narrow_y) &&
+            (!narrow_x || at.x == area.left + width / 2) &&
+            (!narrow_y || at.y == area.top + height / 2)) return 0;
+    }
+    EditPoint grips[SELECTION_GRIPS];
+    selection_grips(area, desk, grips);
+    for (int i = 0; i < SELECTION_GRIPS; ++i)
+        if (llabs((int64_t)at.x - grips[i].x) <= GRIP_RADIUS &&
+            llabs((int64_t)at.y - grips[i].y) <= GRIP_RADIUS) return grip_modes[i];
+    int64_t left = llabs((int64_t)at.x - area.left);
+    int64_t right = llabs((int64_t)at.x - area.right + 1);
+    int64_t top = llabs((int64_t)at.y - area.top);
+    int64_t bottom = llabs((int64_t)at.y - area.bottom + 1);
+    int x = narrow_x && in_x ? 0 : left <= right && left <= slop ? SEL_W : right <= slop ? SEL_E : 0;
+    int y = narrow_y && in_y ? 0 : top <= bottom && top <= slop ? SEL_N : bottom <= slop ? SEL_S : 0;
+    if (x && y) return x | y;
+    return in_y && x ? x : in_x && y ? y : 0;
+}
+
+static int bounded_offset(int start, int64_t delta, int lo, int hi) {
+    if (delta < (int64_t)lo - start) return lo;
+    if (delta > (int64_t)hi - start) return hi;
+    return (int)(start + delta);
+}
+
+static void adjust_axis(int *lo, int *hi, int low, int high, int lower, int64_t delta) {
+    int fixed = lower ? *hi : *lo;
+    int end = bounded_offset(lower ? *lo : *hi, delta, low, high);
+    if (end == fixed) end += lower ? -1 : 1;
+    *lo = min(fixed, end);
+    *hi = max(fixed, end);
+}
+
+Rect selection_adjust(Rect start, Rect desk, int mode, int64_t dx, int64_t dy) {
+    if (mode == SEL_MOVE) {
+        int64_t w = (int64_t)start.right - start.left, h = (int64_t)start.bottom - start.top;
+        int x = bounded_offset(start.left, dx, desk.left, (int)(desk.right - w));
+        int y = bounded_offset(start.top, dy, desk.top, (int)(desk.bottom - h));
+        return (Rect){x, y, (int)(x + w), (int)(y + h)};
+    }
+    if (mode & (SEL_W | SEL_E))
+        adjust_axis(&start.left, &start.right, desk.left, desk.right, mode & SEL_W, dx);
+    if (mode & (SEL_N | SEL_S))
+        adjust_axis(&start.top, &start.bottom, desk.top, desk.bottom, mode & SEL_N, dy);
+    return start;
+}
+
+int selection_dash_white(int64_t length, int along, int across) {
+    return ((along / (length < 8 ? 1 : 4) + across) & 1) == 0;
+}

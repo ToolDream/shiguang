@@ -1,10 +1,10 @@
 # 测试与验收
 
-自动测试分三层，共 27 项：C 逻辑 9 项、设置视图能力检查 10 项（快捷键 5 项、登录启动 5 项）、Windows 平台回归 8 项。命令都在仓库根目录执行（Windows 命令用 PowerShell）。
+自动测试分三层，共 33 项：C 逻辑 14 项、设置视图能力检查 11 项（快捷键 5 项、登录启动 6 项）、Windows 平台回归 8 项。命令都在仓库根目录执行（Windows 命令用 PowerShell）。
 
-## 1. C 逻辑测试（9 项）
+## 1. C 逻辑测试（14 项）
 
-平台无关，Linux、macOS、WSL 或 MinGW 都可运行。裁切 3 项覆盖反向拖选、跨屏拼接、空选区与异常尺寸拒绝；编辑 3 项覆盖历史、工具栏布局与热键编码；调色板 3 项检查主要按钮在明暗两套配色下（常态与按下）的对比度都不低于 4.5:1，并确认调色板每个字段变化都会让缓存失效。
+平台无关，Linux、macOS、WSL 或 MinGW 都可运行。裁切 3 项覆盖反向拖选、跨屏拼接、空选区与异常尺寸拒绝；编辑 8 项覆盖历史、工具栏布局、热键编码、选区边界与调整、八把手命中及窄框标注、短边对比；调色板 3 项检查主要按钮在明暗两套配色下（常态与按下）的对比度都不低于 4.5:1，并确认调色板每个字段变化都会让缓存失效。
 
 调色板测试用到 `pow` / `fmax` / `fmin`，因此在 glibc 与 macOS 上要加 `-lm`；mingw-w64 的 `libm.a` 是空桩，math 来自 msvcrt 与 `libmingwex`，`-lm` 在 Windows 上同样可加。
 
@@ -18,9 +18,9 @@ cc -std=c11 -Wall -Wextra -Werror tests/crop_test.c src/crop.c -o "$out/crop-tes
   "$out/ui-palette-test"
 ~~~
 
-## 2. 设置视图能力检查（10 项）
+## 2. 设置视图能力检查（11 项）
 
-需要 Nim 与相邻的 Leaf 源码。用 Leaf 的 Win32 能力表检查五种设置视图：默认键帽、全修饰键组合、未注册且托盘不可用、录入中、冲突反馈。同时检查登录启动的五种视图状态。这是构建期的静态合同检查，不是 Windows 运行结果。
+需要 Nim 与相邻的 Leaf 源码。用 Leaf 的 Win32 能力表检查五种设置视图：默认键帽、全修饰键组合、未注册且托盘不可用、录入中、冲突反馈。同时检查登录启动的六种视图状态。这是构建期的静态合同检查，不是 Windows 运行结果。
 
 ~~~sh
 nim c -r --path:../leaf/src --nimcache:build/nimcache --out:build/settings_capabilities_test tests/settings_capabilities_test.nim

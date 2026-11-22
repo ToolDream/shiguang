@@ -103,7 +103,7 @@ let Settings = defineComponent[tuple[], State[SettingsState]]("Settings",
       startup = model.startup, startupError = model.startupError, onStartup = toggleStartup)))
 
 proc runSettingsHost(background: bool): int =
-  let application = app(Settings, title = settingsTitle, width = 574, height = 375)
+  let application = app(Settings, title = settingsTitle, width = settingsWidth, height = settingsHeight)
     .withNativeTheme(shadcnLight) # Native control semantics and metrics; application chrome follows Windows.
   defer:
     recordKey = nil

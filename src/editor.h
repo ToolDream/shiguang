@@ -26,6 +26,14 @@ typedef struct { Rect bounds; int cols, cell; } Dock;
 size_t editor_screen(Rect area, const Rect *screens, size_t count);
 Dock editor_dock(Rect area, Rect screen, int cell, int gap, int buttons);
 Dock editor_popup(Dock bar, Rect screen, int gap, int buttons);
+// Top, bottom, left, right stripes of the real selection, clipped to one surface.
+void selection_edges(Rect area, Rect clip, Rect edges[4]);
+enum { SEL_N = 1, SEL_E = 2, SEL_S = 4, SEL_W = 8, SEL_MOVE = 16 };
+enum { SELECTION_GRIPS = 8, GRIP_RADIUS = 4 };
+void selection_grips(Rect area, Rect desktop, EditPoint points[SELECTION_GRIPS]);
+int selection_hit(Rect area, Rect desktop, EditPoint at, int alt);
+Rect selection_adjust(Rect start, Rect desktop, int mode, int64_t dx, int64_t dy);
+int selection_dash_white(int64_t length, int along, int across);
 
 // The low byte is the Win32 virtual key; the next nibble is MOD_*.
 #define HOTKEY_DEFAULT 0x0653u

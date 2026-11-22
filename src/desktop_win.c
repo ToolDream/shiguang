@@ -183,10 +183,12 @@ int sg_record_hotkey(int recording) {
 }
 
 int sg_set_hotkey(uint32_t chord) {
-    if (!valid_hotkey(chord) || phase != IDLE) return 1;
+    if (!valid_hotkey(chord)) return 3;
+    if (phase != IDLE) return 4;
     if (sg_hotkey() == chord) return 0;
     int next_id = active_hotkey == HOTKEY_A ? HOTKEY_B : HOTKEY_A;
-    if (!register_hotkey(next_id, chord)) return 1;
+    if (!register_hotkey(next_id, chord))
+        return GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED ? 1 : 4;
     DWORD value = HOTKEY_TAG | chord;
     if (RegSetKeyValueW(HKEY_CURRENT_USER, REG_KEY, L"Hotkey", REG_DWORD,
                        &value, sizeof value) != ERROR_SUCCESS) {
@@ -197,6 +199,76 @@ int sg_set_hotkey(uint32_t chord) {
     active_hotkey = next_id;
     shortcut = chord;
     return 0;
+}
+
+// The app owns only an exact command for this executable, never Windows'
+// StartupApproved state or another installation's Run entry.
+#define STARTUP_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define STARTUP_NAME L"Shiguang.Screenshot"
+enum StartupState { STARTUP_OFF, STARTUP_ON, STARTUP_FOREIGN, STARTUP_UNKNOWN };
+enum { STARTUP_COMMAND_CAP = 260 };
+
+static BOOL startup_command(const WCHAR *exe, WCHAR out[STARTUP_COMMAND_CAP]) {
+    if (!*exe || wcschr(exe, L'"') || wcslen(exe) + ARRAYSIZE(L"\"\" --startup") > STARTUP_COMMAND_CAP)
+        return FALSE;
+    return swprintf(out, STARTUP_COMMAND_CAP, L"\"%ls\" --startup", exe) > 0;
+}
+
+static BOOL current_startup_command(WCHAR out[STARTUP_COMMAND_CAP]) {
+    WCHAR exe[STARTUP_COMMAND_CAP];
+    DWORD size = GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe));
+    return size && size < ARRAYSIZE(exe) && startup_command(exe, out);
+}
+
+static enum StartupState startup_state(HKEY key, const WCHAR *command) {
+    WCHAR stored[STARTUP_COMMAND_CAP];
+    DWORD type = 0, bytes = sizeof stored;
+    LSTATUS status = RegQueryValueExW(key, STARTUP_NAME, NULL, &type, (BYTE *)stored, &bytes);
+    if (status == ERROR_FILE_NOT_FOUND) return STARTUP_OFF;
+    if (status == ERROR_MORE_DATA) return STARTUP_FOREIGN;
+    if (status != ERROR_SUCCESS) return STARTUP_UNKNOWN;
+    size_t expected = (wcslen(command) + 1) * sizeof(WCHAR);
+    return type == REG_SZ && bytes == expected && !memcmp(stored, command, expected)
+        ? STARTUP_ON : STARTUP_FOREIGN;
+}
+
+static LSTATUS startup_apply(HKEY key, const WCHAR *command, BOOL enable) {
+    enum StartupState state = startup_state(key, command);
+    if (state == STARTUP_UNKNOWN) return ERROR_READ_FAULT;
+    if (state == STARTUP_FOREIGN) return ERROR_ALREADY_EXISTS;
+    if ((state == STARTUP_ON) == enable) return ERROR_SUCCESS;
+    if (!enable) return RegDeleteValueW(key, STARTUP_NAME);
+    return RegSetValueExW(key, STARTUP_NAME, 0, REG_SZ, (const BYTE *)command,
+                         (DWORD)((wcslen(command) + 1) * sizeof(WCHAR)));
+}
+
+int sg_startup_state(void) {
+    WCHAR command[STARTUP_COMMAND_CAP];
+    if (!current_startup_command(command)) return STARTUP_UNKNOWN;
+    HKEY key;
+    LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_KEY, 0, KEY_QUERY_VALUE, &key);
+    if (status == ERROR_FILE_NOT_FOUND) return STARTUP_OFF;
+    if (status != ERROR_SUCCESS) return STARTUP_UNKNOWN;
+    int state = startup_state(key, command);
+    RegCloseKey(key);
+    return state;
+}
+
+int sg_set_startup(int enable) {
+    WCHAR command[STARTUP_COMMAND_CAP];
+    if (!current_startup_command(command)) return 0;
+    HKEY key;
+    REGSAM access = KEY_QUERY_VALUE | KEY_SET_VALUE;
+    LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_KEY, 0, access, &key);
+    if (status == ERROR_FILE_NOT_FOUND) {
+        if (!enable) return 1;
+        status = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_KEY, 0, NULL, REG_OPTION_NON_VOLATILE,
+                                 access, NULL, &key, NULL);
+    }
+    if (status != ERROR_SUCCESS) return 0;
+    status = startup_apply(key, command, enable != 0);
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS;
 }
 
 static BOOL CALLBACK collect_monitor(HMONITOR monitor, HDC ignored, LPRECT r, LPARAM arg) {
@@ -945,14 +1017,29 @@ static void start_capture(void) {
     idle();
 }
 
-static LRESULT CALLBACK change_button_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp,
+enum SettingsFace { SETTINGS_CHANGE = 1, SETTINGS_QUIT, SETTINGS_MIN, SETTINGS_CLOSE, SETTINGS_TITLE, SETTINGS_FEEDBACK };
+static HWND settings_title;
+
+static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp,
                                           UINT_PTR id, DWORD_PTR ref) {
     (void)ref;
-    if (msg == WM_NCDESTROY) RemoveWindowSubclass(w, change_button_proc, id);
+    if (msg == WM_NCDESTROY) {
+        if (id == SETTINGS_TITLE) settings_title = NULL;
+        RemoveWindowSubclass(w, settings_face_proc, id);
+    }
+    if (id == SETTINGS_TITLE && msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if (msg == WM_MOUSEMOVE) {
+        TRACKMOUSEEVENT track = {.cbSize = sizeof track, .dwFlags = TME_LEAVE, .hwndTrack = w};
+        TrackMouseEvent(&track);
+        InvalidateRect(w, NULL, FALSE);
+    }
+    if (msg == WM_MOUSELEAVE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS || msg == WM_UPDATEUISTATE)
+        InvalidateRect(w, NULL, FALSE);
     if (msg != WM_PAINT) return DefSubclassProc(w, msg, wp, lp);
+
     HIGHCONTRASTW contrast = {.cbSize = sizeof contrast};
-    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof contrast, &contrast, 0) &&
-        (contrast.dwFlags & HCF_HIGHCONTRASTON)) return DefSubclassProc(w, msg, wp, lp);
+    BOOL hc = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof contrast, &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON);
     PAINTSTRUCT ps = {0};
     HDC dc = BeginPaint(w, &ps);
     if (dc) {
@@ -961,22 +1048,61 @@ static LRESULT CALLBACK change_button_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
         FillRect(dc, &r, GetSysColorBrush(COLOR_WINDOW));
         int saved = SaveDC(dc);
         if (saved) {
-            LRESULT state = SendMessageW(w, BM_GETSTATE, 0, 0);
+            int dpi = (int)GetDpiForWindow(w);
+            POINT p;
+            BOOL hot = GetCursorPos(&p) && WindowFromPoint(p) == w;
+            BOOL pressed = (SendMessageW(w, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
+            COLORREF ink = RGB(46, 67, 87);
             SelectObject(dc, GetStockObject(DC_BRUSH));
             SelectObject(dc, GetStockObject(DC_PEN));
-            SetDCBrushColor(dc, state & BST_PUSHED ? RGB(215, 232, 248) : RGB(234, 242, 251));
-            SetDCPenColor(dc, RGB(197, 217, 238));
-            int radius = MulDiv(14, (int)GetDpiForWindow(w), 96);
-            RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
-            HFONT font = (HFONT)SendMessageW(w, WM_GETFONT, 0, 0);
-            if (font) SelectObject(dc, font);
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, RGB(36, 88, 137));
-            wchar_t caption[24];
-            int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
-            DrawTextW(dc, caption, n, &r, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            if (id == SETTINGS_CHANGE || id == SETTINGS_QUIT) {
+                BOOL primary = id == SETTINGS_CHANGE;
+                COLORREF fill = primary ? (pressed ? RGB(205, 224, 244) :
+                    hot ? RGB(219, 234, 250) : RGB(231, 241, 251)) :
+                    pressed ? RGB(229, 239, 249) : hot ? RGB(245, 249, 252) : RGB(255, 255, 255);
+                SetDCBrushColor(dc, hc ? GetSysColor(hot ? COLOR_HIGHLIGHT : COLOR_WINDOW) : fill);
+                SetDCPenColor(dc, hc ? GetSysColor(COLOR_WINDOWTEXT) : RGB(194, 213, 232));
+                int radius = MulDiv(14, dpi, 96);
+                RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+                if (primary) ink = RGB(36, 88, 137);
+            }
+            if (hc) ink = GetSysColor(hot && id != SETTINGS_TITLE ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT);
+            if (id == SETTINGS_MIN || id == SETTINGS_CLOSE) {
+                if (hot || pressed) {
+                    SetDCBrushColor(dc, hc ? GetSysColor(COLOR_HIGHLIGHT) :
+                        id == SETTINGS_CLOSE ? RGB(192, 38, 49) : RGB(231, 240, 249));
+                    FillRect(dc, &r, GetStockObject(DC_BRUSH));
+                    if (!hc && id == SETTINGS_CLOSE) ink = RGB(255, 255, 255);
+                }
+                SetDCPenColor(dc, ink);
+                int x = r.right / 2, y = r.bottom / 2, a = MulDiv(5, dpi, 96);
+                if (id == SETTINGS_MIN)
+                    Polyline(dc, (POINT[]){{x - a, y}, {x + a + 1, y}}, 2);
+                else {
+                    Polyline(dc, (POINT[]){{x-a,y-a},{x+a+1,y+a+1}}, 2);
+                    Polyline(dc, (POINT[]){{x+a,y-a},{x-a-1,y+a+1}}, 2);
+                }
+            } else {
+                UINT align = DT_CENTER;
+                if (id == SETTINGS_TITLE) {
+                    int inset = MulDiv(18, dpi, 96), side = MulDiv(21, dpi, 96);
+                    DrawIconEx(dc, inset, (r.bottom-side)/2, small_icon, side, side, 0, NULL, DI_NORMAL);
+                    r.left = inset + side + MulDiv(10, dpi, 96);
+                    align = DT_LEFT;
+                } else if (id == SETTINGS_FEEDBACK) {
+                    if (!hc) ink = RGB(134, 82, 25);
+                    align = DT_LEFT;
+                }
+                HFONT font = (HFONT)SendMessageW(w, WM_GETFONT, 0, 0);
+                if (font) SelectObject(dc, font);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, ink);
+                wchar_t caption[192];
+                int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
+                DrawTextW(dc, caption, n, &r, DT_SINGLELINE | DT_VCENTER | align | DT_NOPREFIX);
+            }
             if (GetFocus() == w && !(SendMessageW(w, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
-                InflateRect(&r, -3, -3);
+                InflateRect(&r, -4, -4);
                 DrawFocusRect(dc, &r);
             }
             RestoreDC(dc, saved);
@@ -986,16 +1112,30 @@ static LRESULT CALLBACK change_button_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
     return 0;
 }
 
-static BOOL CALLBACK style_change_button(HWND w, LPARAM unused) {
+static BOOL CALLBACK style_settings_controls(HWND w, LPARAM unused) {
     (void)unused;
-    wchar_t klass[16], label[24];
-    if (GetClassNameW(w, klass, ARRAYSIZE(klass)) && !wcscmp(klass, L"Button") &&
-        GetWindowTextW(w, label, ARRAYSIZE(label)) &&
-        (!wcscmp(label, L"更改") || !wcscmp(label, L"取消录入"))) {
-        SetWindowSubclass(w, change_button_proc, 1, 0);
-        return FALSE;
+    wchar_t klass[16], label[32];
+    if (!GetClassNameW(w, klass, ARRAYSIZE(klass)) ||
+        !GetWindowTextW(w, label, ARRAYSIZE(label))) return TRUE;
+    UINT_PTR face = 0;
+    if (!wcscmp(klass, L"Button")) {
+        if (!wcscmp(label, L"更改") || !wcscmp(label, L"重新录入") || !wcscmp(label, L"取消录入"))
+            face = SETTINGS_CHANGE;
+        else if (!wcscmp(label, L"退出拾光")) face = SETTINGS_QUIT;
+        else if (!wcscmp(label, L"最小化")) face = SETTINGS_MIN;
+        else if (!wcscmp(label, L"关闭")) face = SETTINGS_CLOSE;
+    } else if (!wcscmp(klass, L"Static") && !wcscmp(label, L"拾光截图 / 设置")) {
+        face = SETTINGS_TITLE;
+        settings_title = w;
+    } else if (!wcscmp(klass, L"Static") && (!wcscmp(label, L" ") || label[0] == L'ⓘ')) {
+        face = SETTINGS_FEEDBACK;
     }
+    if (face) SetWindowSubclass(w, settings_face_proc, face, 0);
     return TRUE;
+}
+
+void sg_settings_caption(int close) {
+    if (settings) PostMessageW(settings, close ? WM_CLOSE : WM_SYSCOMMAND, close ? 0 : SC_MINIMIZE, 0);
 }
 
 static LRESULT CALLBACK settings_subclass(HWND w, UINT msg, WPARAM wp, LPARAM lp,
@@ -1006,6 +1146,14 @@ static LRESULT CALLBACK settings_subclass(HWND w, UINT msg, WPARAM wp, LPARAM lp
         sg_record_hotkey(0);
         if (cancel) PostMessageW(w, SG_RECORD_MESSAGE, 0, 0);
     }
+    if (msg == WM_NCHITTEST && settings_title && !IsIconic(w)) {
+        LRESULT hit = DefSubclassProc(w, msg, wp, lp);
+        RECT caption;
+        if (hit == HTCLIENT && GetWindowRect(settings_title, &caption) &&
+            PtInRect(&caption, (POINT){GET_X_LPARAM(lp), GET_Y_LPARAM(lp)})) return HTCAPTION;
+        return hit;
+    }
+    if (msg == WM_NCLBUTTONDBLCLK && wp == HTCAPTION) return 0;
     if (msg == WM_CLOSE) {
         if (tray_ready) ShowWindow(w, SW_HIDE);
         return 0;
@@ -1021,6 +1169,16 @@ static LRESULT CALLBACK settings_subclass(HWND w, UINT msg, WPARAM wp, LPARAM lp
 int sg_bind_settings(HWND w) {
     if (!SetWindowSubclass(w, settings_subclass, 1, 0)) return 0;
     settings = w;
+    // Win32 shows a disabled maximize button beside an enabled minimize button.
+    // Use two native Button children in the caption instead, retaining system commands.
+    LONG_PTR style = GetWindowLongPtrW(w, GWL_STYLE);
+    SetLastError(0);
+    if (!SetWindowLongPtrW(w, GWL_STYLE, (style & ~(WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX)) | WS_BORDER)
+        && GetLastError()) return 0;
+    if (!SetWindowPos(w, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                      SWP_NOZORDER | SWP_NOACTIVATE)) return 0;
+    DWORD rounded = 2; // DWMWCP_ROUND; on older Windows this preference is ignored.
+    DwmSetWindowAttribute(w, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &rounded, sizeof rounded);
     SendMessageW(w, WM_SETICON, ICON_SMALL, (LPARAM)small_icon);
     SendMessageW(w, WM_SETICON, ICON_BIG, (LPARAM)large_icon);
     return 1;
@@ -1028,9 +1186,10 @@ int sg_bind_settings(HWND w) {
 
 static void show_settings(void) {
     if (!settings) return;
-    EnumChildWindows(settings, style_change_button, 0);
+    EnumChildWindows(settings, style_settings_controls, 0);
     ShowWindow(settings, IsIconic(settings) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(settings);
+    PostMessageW(settings, SG_TRAY_MESSAGE, (WPARAM)tray_ready, 0);
 }
 
 static void tray_menu(void) {
@@ -1154,9 +1313,13 @@ int sg_start(void) {
     return 0;
 }
 
-void sg_ready(void) {
+void sg_ready(int background) {
     tray_ready = add_tray();
     PostMessageW(settings, SG_TRAY_MESSAGE, (WPARAM)tray_ready, 0);
+    if (background) {
+        if (!tray_ready) sg_exit();
+        return;
+    }
     if (!tray_ready) show_settings();
     else if (!active_hotkey) notice(L"截图快捷键已被占用。请在托盘设置里换一个，或从托盘截图。");
 }

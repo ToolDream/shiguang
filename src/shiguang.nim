@@ -2,6 +2,7 @@ when not (defined(windows) and defined(amd64)):
   {.error: "拾光截图的桌面应用需要 Windows x64".}
 
 import leaf
+import std/os
 import settings_view
 import leaf/[native_layout, styles, ui_thread]
 import leaf/backends/win32/[api, backend, calls, host]
@@ -19,11 +20,14 @@ import leaf/backends/win32/[api, backend, calls, host]
 proc sg_start(): cint
 proc sg_stop()
 proc sg_bind_settings(window: HWND): cint
-proc sg_ready()
+proc sg_ready(background: cint)
+proc sg_startup_state(): cint
+proc sg_set_startup(enable: cint): cint
 proc sg_after_dispatch()
 proc sg_hotkey(): uint32
 proc sg_set_hotkey(chord: uint32): cint
 proc sg_record_hotkey(recording: cint): cint {.discardable.}
+proc sg_settings_caption(action: cint)
 proc sg_exit()
 proc sg_fatal(message: cstring)
 {.pop.}
@@ -37,23 +41,42 @@ const
 var recordKey: proc(chord: uint32)
 var trayState: proc(ready: bool)
 
-type SettingsState = tuple[chord: uint32, recording: bool, status: string, trayReady: bool]
+type SettingsState = object
+  chord: uint32
+  recording: bool
+  status: string
+  trayReady: bool
+  startup: cint
+  startupError: bool
 let Settings = defineComponent[tuple[], State[SettingsState]]("Settings",
   proc(ctx: MountContext, props: tuple[]): State[SettingsState] =
-    ctx.state((sg_hotkey(), false, "", false)),
+    ctx.state(SettingsState(chord: sg_hotkey(), startup: sg_startup_state())),
   proc(ctx: ComponentContext, props: tuple[], session: State[SettingsState]): UiDescription =
     let model = ctx.value(session)
     trayState = proc(ready: bool) =
       discard session.update(proc(old: SettingsState): SettingsState =
-        (old.chord, old.recording, old.status, ready))
+        result = old
+        result.trayReady = ready
+        result.startup = sg_startup_state())
+    let toggleStartup: Callback = proc(e: Event) =
+      let ok = sg_set_startup(cint(e.checked)) != 0
+      let actual = sg_startup_state()
+      discard session.update(proc(old: SettingsState): SettingsState =
+        result = old
+        result.startup = actual
+        result.startupError = not ok or actual != cint(e.checked))
     let toggleRecording: Callback = proc(e: Event) =
       if model.recording:
         sg_record_hotkey(0)
         recordKey = nil
-        discard session.update(proc(old: SettingsState): SettingsState = (old.chord, false, "", old.trayReady))
+        discard session.update(proc(old: SettingsState): SettingsState =
+          result = old
+          result.recording = false
+          result.status = "")
       elif sg_record_hotkey(1) == 0:
         discard session.update(proc(old: SettingsState): SettingsState =
-          (old.chord, false, "无法开始录入，请重新打开设置后再试。", old.trayReady))
+          result = old
+          result.status = "无法开始录入，请重新打开设置后再试。")
       else:
         recordKey = proc(chord: uint32) =
           sg_record_hotkey(0)
@@ -61,19 +84,25 @@ let Settings = defineComponent[tuple[], State[SettingsState]]("Settings",
           let status =
             if chord == 0: ""
             else:
-              case sg_set_hotkey(chord)
-              of 0: ""
-              of 1: "此组合键无效或已被占用，未更改。"
-              else: "无法保存组合键，未更改。"
+              let outcome = sg_set_hotkey(chord)
+              shortcutFeedback(outcome, sg_hotkey())
           discard session.update(proc(old: SettingsState): SettingsState =
-            (sg_hotkey(), false, status, old.trayReady))
+            result = old
+            result.chord = sg_hotkey()
+            result.recording = false
+            result.status = status)
         discard session.update(proc(old: SettingsState): SettingsState =
-          (old.chord, true, "", old.trayReady))
+          result = old
+          result.recording = true
+          result.status = "")
     host(settingsView(model.chord, model.recording, model.status, model.trayReady,
-      toggleRecording, proc(e: Event) = sg_exit())))
+      toggleRecording, proc(e: Event) = sg_exit(),
+      proc(e: Event) = sg_settings_caption(0),
+      proc(e: Event) = sg_settings_caption(1),
+      startup = model.startup, startupError = model.startupError, onStartup = toggleStartup)))
 
-proc runSettingsHost(): int =
-  let application = app(Settings, title = "拾光截图 / 设置", width = 544, height = 276)
+proc runSettingsHost(background: bool): int =
+  let application = app(Settings, title = settingsTitle, width = 574, height = 375)
     .withNativeTheme(shadcnLight)
   defer:
     recordKey = nil
@@ -130,22 +159,23 @@ proc runSettingsHost(): int =
   window.setSafeTick(proc() = native.safeListTurn())
   if sg_bind_settings(window.windowHandle()) == 0:
     raise newException(OSError, "无法绑定设置窗口。")
-  sg_ready()
+  sg_ready(cint(background))
   result = window.pump()
   if settingsError != nil: raise settingsError
 
 proc main(): int =
+  let background = paramCount() == 1 and paramStr(1) == "--startup"
   let start = sg_start()
   defer: sg_stop()
   case start
   of 1: return 0
   of 0:
     try:
-      return runSettingsHost()
+      return runSettingsHost(background)
     except CatchableError as error:
-      sg_fatal(error.msg.cstring)
+      if not background: sg_fatal(error.msg.cstring)
   else:
-    sg_fatal("无法初始化截图服务。需要 Windows 10 1703 或更新版本。")
+    if not background: sg_fatal("无法初始化截图服务。需要 Windows 10 1703 或更新版本。")
   1
 
 when isMainModule:

@@ -254,6 +254,7 @@ static void replace_test(void) {
     const int blocker = 21;
     assert(sg_set_hotkey(first) == 0 && sg_hotkey() == first && decode_hotkey(persisted) == first);
     int old_id = active_hotkey;
+    assert(sg_set_hotkey(VK_F6) == 3 && sg_hotkey() == first && active_hotkey == old_id);
     assert(RegisterHotKey(owner, blocker, mod | MOD_NOREPEAT, VK_F22));
     assert(sg_set_hotkey(second) == 1 && sg_hotkey() == first && active_hotkey == old_id);
     assert(decode_hotkey(persisted) == first && UnregisterHotKey(owner, blocker));
@@ -458,6 +459,99 @@ static void save_editor_test(void) {
     picked_path = NULL;
 }
 
+static void settings_caption_test(void) {
+    const WNDCLASSW cls = {.lpfnWndProc = DefWindowProcW, .hInstance = instance,
+                           .lpszClassName = L"Shiguang.Test.Settings"};
+    assert(RegisterClassW(&cls));
+    HWND window = CreateWindowExW(0, cls.lpszClassName, APP_TITLE, WS_OVERLAPPEDWINDOW,
+        60, 60, 570, 350, NULL, NULL, instance, NULL);
+    assert(window && sg_bind_settings(window));
+    LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+    assert(!(style & (WS_MAXIMIZEBOX | WS_THICKFRAME | WS_DLGFRAME)));
+    assert((style & (WS_SYSMENU | WS_MINIMIZEBOX)) == (WS_SYSMENU | WS_MINIMIZEBOX));
+    HWND title = CreateWindowExW(0, L"STATIC", L"拾光截图 / 设置", WS_CHILD | WS_VISIBLE,
+        0, 0, 400, 48, window, NULL, instance, NULL);
+    HWND min = CreateWindowExW(0, L"BUTTON", L"最小化", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        400, 0, 46, 48, window, NULL, instance, NULL);
+    HWND close = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        446, 0, 46, 48, window, NULL, instance, NULL);
+    assert(title && min && close);
+    show_settings();
+    assert(settings_title == title && IsWindowVisible(window));
+    RECT header, min_rect;
+    assert(GetWindowRect(title, &header) && GetWindowRect(min, &min_rect));
+    assert(SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(header.left + 20, header.top + 20)) == HTCAPTION);
+    assert(SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(min_rect.left + 20, min_rect.top + 20)) == HTCLIENT);
+    RECT close_rect;
+    assert(GetWindowRect(close, &close_rect));
+    assert(min_rect.right - min_rect.left == close_rect.right - close_rect.left);
+    assert(SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(close_rect.left + 20, close_rect.top + 20)) == HTCLIENT);
+
+    MSG message;
+    sg_settings_caption(0);
+    assert(PeekMessageW(&message, window, WM_SYSCOMMAND, WM_SYSCOMMAND, PM_REMOVE));
+    DispatchMessageW(&message);
+    assert(IsIconic(window));
+    show_settings();
+    assert(!IsIconic(window) && IsWindowVisible(window));
+
+    tray_ready = TRUE;  // Use the real close handler without installing a tray icon.
+    sg_settings_caption(1);
+    assert(PeekMessageW(&message, window, WM_CLOSE, WM_CLOSE, PM_REMOVE));
+    DispatchMessageW(&message);
+    assert(IsWindow(window) && !IsWindowVisible(window));
+    tray_ready = FALSE;
+    assert(DestroyWindow(window));
+}
+
+static void startup_test(void) {
+    GUID id;
+    WCHAR guid[40], path[96];
+    assert(CoCreateGuid(&id) == S_OK && StringFromGUID2(&id, guid, ARRAYSIZE(guid)));
+    assert(swprintf(path, ARRAYSIZE(path), L"Software\\Shiguang.Test.Startup-%ls", guid) > 0);
+    HKEY key, readonly;
+    DWORD created;
+    assert(RegCreateKeyExW(HKEY_CURRENT_USER, path, 0, NULL, REG_OPTION_VOLATILE,
+        KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, &created) == ERROR_SUCCESS);
+    assert(created == REG_CREATED_NEW_KEY);
+    assert(RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_QUERY_VALUE, &readonly) == ERROR_SUCCESS);
+
+    const WCHAR exe[] = L"C:\\应用 程序\\拾光.exe", expected[] = L"\"C:\\应用 程序\\拾光.exe\" --startup";
+    WCHAR command[260], stored[260];
+    assert(startup_command(exe, command) && !wcscmp(expected, command));
+    assert(!startup_command(L"C:\\bad\"name.exe", stored));
+    assert(startup_state(key, command) == STARTUP_OFF);
+    assert(startup_apply(readonly, command, TRUE) == ERROR_ACCESS_DENIED);
+    assert(startup_state(key, command) == STARTUP_OFF);
+    assert(startup_apply(key, command, TRUE) == ERROR_SUCCESS);
+    assert(startup_apply(readonly, command, TRUE) == ERROR_SUCCESS); // no second write
+    assert(startup_state(key, command) == STARTUP_ON);
+    DWORD bytes = sizeof stored, type;
+    assert(RegQueryValueExW(key, STARTUP_NAME, NULL, &type, (BYTE *)stored, &bytes) == ERROR_SUCCESS);
+    assert(type == REG_SZ && bytes == sizeof expected && !memcmp(stored, expected, bytes));
+    assert(startup_apply(readonly, command, FALSE) == ERROR_ACCESS_DENIED);
+    assert(startup_state(key, command) == STARTUP_ON);
+
+    // A different path or a non-string entry is not ours to replace or delete.
+    const WCHAR moved[] = L"\"D:\\moved\\拾光.exe\" --startup";
+    assert(startup_state(key, moved) == STARTUP_FOREIGN);
+    assert(startup_apply(key, moved, TRUE) == ERROR_ALREADY_EXISTS);
+    assert(startup_apply(key, moved, FALSE) == ERROR_ALREADY_EXISTS);
+    assert(startup_state(key, command) == STARTUP_ON);
+    assert(startup_apply(key, command, FALSE) == ERROR_SUCCESS);
+    assert(startup_apply(readonly, command, FALSE) == ERROR_SUCCESS);
+    DWORD marker = 42;
+    assert(RegSetValueExW(key, STARTUP_NAME, 0, REG_DWORD, (BYTE *)&marker, sizeof marker) == ERROR_SUCCESS);
+    assert(startup_state(key, command) == STARTUP_FOREIGN);
+    assert(startup_apply(key, command, FALSE) == ERROR_ALREADY_EXISTS);
+    DWORD read_marker = 0;
+    bytes = sizeof read_marker;
+    assert(RegQueryValueExW(key, STARTUP_NAME, NULL, &type, (BYTE *)&read_marker, &bytes) == ERROR_SUCCESS);
+    assert(type == REG_DWORD && read_marker == marker);
+    assert(RegCloseKey(readonly) == ERROR_SUCCESS && RegCloseKey(key) == ERROR_SUCCESS);
+    assert(RegDeleteKeyW(HKEY_CURRENT_USER, path) == ERROR_SUCCESS);
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     assert(SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) ||
@@ -480,7 +574,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "replace")) replace_test();
     else if (!strcmp(argv[1], "edit")) edit_test();
     else if (!strcmp(argv[1], "save-edit")) save_editor_test();
-    else assert(!"expected save, hotkey, preview, replace, edit or save-edit");
+    else if (!strcmp(argv[1], "settings-caption")) settings_caption_test();
+    else if (!strcmp(argv[1], "startup")) startup_test();
+    else assert(!"unknown Windows regression case");
     sg_stop();
     CoUninitialize();
     printf("%s regression passed\n", argv[1]);

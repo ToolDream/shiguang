@@ -1,0 +1,394 @@
+name: 构建与发布
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIP_NAME: shiguang-windows-x64.zip
+
+jobs:
+  build:
+    name: Windows x64 测试与构建
+    # 删除事件不构建；dev- 前缀是本流水线自用的机器 tag，推送它不构建也不发布。
+    if: github.event.deleted != true && !(github.ref_type == 'tag' && startsWith(github.ref_name, 'dev-'))
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: 检出拾光源码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 检出固定提交的 Leaf
+        uses: actions/checkout@v4
+        with:
+          repository: SatoriTours/Leaf
+          ref: df53b244383bc79abd3d8a035d4ac29636602444
+          path: leaf
+          persist-credentials: false
+
+      - name: 校验 Leaf 提交
+        shell: pwsh
+        env:
+          LEAF_COMMIT: df53b244383bc79abd3d8a035d4ac29636602444
+        run: |
+          $actual = (git -C leaf rev-parse HEAD).Trim()
+          if ($actual -ne $env:LEAF_COMMIT) { throw "Leaf 提交不匹配：$actual" }
+          "Leaf commit：$actual"
+
+      - name: 准备 MinGW-w64 工具链
+        shell: pwsh
+        run: ./scripts/prepare_windows_toolchain.ps1
+
+      - name: 安装 Nim 2.2.6
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.6'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 记录构建身份与工具链
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = (git rev-parse HEAD).Trim()
+          # 按完整 ref（如 refs/tags/v1.2.3）解析对象，lightweight 得到提交，annotated 得到 tag 对象。
+          $apiRef = $env:GITHUB_REF -replace '^refs/', ''
+          $refObject = (gh api "repos/$env:GH_REPO/git/ref/$apiRef" --jq .object.sha).Trim()
+          if (-not $commit -or -not $refObject) { throw '无法读取提交或 ref 对象' }
+          "SG_COMMIT=$commit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SG_REF_OBJECT=$refObject" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "commit：$commit"
+          "ref：$env:GITHUB_REF"
+          "ref 对象：$refObject"
+          nim --version
+          gcc --version
+          gcc -dumpmachine
+
+      - name: C 逻辑测试 6 项
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          gcc -std=c11 -Wall -Wextra -Werror tests/crop_test.c src/crop.c -o build/crop_test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'crop_test 编译失败' }
+          ./build/crop_test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'crop_test 失败' }
+          gcc -std=c11 -Wall -Wextra -Werror tests/editor_test.c src/editor.c src/crop.c -o build/editor_test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'editor_test 编译失败' }
+          ./build/editor_test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'editor_test 失败' }
+
+      - name: 设置视图能力检查（含登录启动）
+        shell: pwsh
+        run: |
+          $output = & nim c -r --path:leaf/src --nimcache:build/nimcache --out:build/settings_capabilities_test.exe tests/settings_capabilities_test.nim 2>&1
+          $code = $LASTEXITCODE
+          $output | Write-Output
+          if ($code -ne 0) { throw "设置视图能力检查失败（退出码 $code）" }
+          if (-not ($output -match '5 Settings views passed the Leaf Win32 capability check')) {
+            throw '未出现能力检查通过行：5 Settings views passed the Leaf Win32 capability check'
+          }
+          if (-not ($output -match '5 Startup views passed the Leaf Win32 capability check')) {
+            throw '未出现登录启动能力检查通过行'
+          }
+
+      - name: 构建 Windows x64 可执行文件
+        shell: pwsh
+        run: |
+          nim c -d:release --cc:gcc --app:gui --path:leaf/src --nimcache:build/nimcache --out:build/shiguang.exe src/shiguang.nim
+          if ($LASTEXITCODE -ne 0) { throw '拾光截图构建失败' }
+          $exe = Get-Item build/shiguang.exe -ErrorAction SilentlyContinue
+          if (-not $exe -or $exe.Length -le 0) { throw 'build/shiguang.exe 缺失或为空' }
+          "shiguang.exe 大小：$($exe.Length) 字节"
+
+      # 链接库与 r6 现场实测一致：desktop_win.c 的标题栏按钮没有引入新的 Win32 库。
+      - name: 平台回归 8 项
+        shell: pwsh
+        run: |
+          gcc -std=c11 -D_WIN32_WINNT=0x0a00 tests/regression_win.c src/crop.c src/editor.c src/editor_win.c -o build/regression_win.exe -luser32 -lgdi32 -lmsimg32 -ldwmapi -lcomctl32 -lshell32 -ladvapi32 -lole32 -luuid -lwindowscodecs
+          if ($LASTEXITCODE -ne 0) { throw '回归程序构建失败' }
+          foreach ($case in 'save', 'hotkey', 'preview', 'replace', 'edit', 'save-edit', 'settings-caption', 'startup') {
+            "== regression_win $case =="
+            ./build/regression_win.exe $case
+            $code = $LASTEXITCODE
+            "regression_win $case 退出码：$code"
+            if ($code -ne 0) { throw "回归失败：$case（退出码 $code）" }
+          }
+
+      - name: 解析动态库依赖
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $system32 = Join-Path $env:SystemRoot 'System32'
+          $toolchainBin = Split-Path (Get-Command gcc).Source -Parent
+          New-Item -ItemType Directory -Force build/pkg | Out-Null
+          Copy-Item -LiteralPath build/shiguang.exe -Destination build/pkg/shiguang.exe -Force
+
+          $cache = @{}
+          function Get-DllImports([string]$file) {
+            if ($cache.ContainsKey($file)) { return $cache[$file] }
+            $raw = & objdump -p $file
+            if ($LASTEXITCODE -ne 0) { throw "objdump 无法读取 $file" }
+            $names = @($raw | Select-String -Pattern 'DLL Name:\s*(\S+)\s*$' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() })
+            if ($names.Count -eq 0) { throw "从 $file 读到空导入表" }
+            $cache[$file] = $names
+            return $names
+          }
+
+          $pending = [System.Collections.Generic.Queue[string]]::new()
+          foreach ($name in Get-DllImports (Join-Path 'build/pkg' 'shiguang.exe')) { $pending.Enqueue($name) }
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $system = [System.Collections.Generic.List[string]]::new()
+          $bundled = [System.Collections.Generic.List[string]]::new()
+          while ($pending.Count -gt 0) {
+            if ($seen.Count -gt 256) { throw '依赖图超过 256 个 DLL，停止解析' }
+            $name = $pending.Dequeue()
+            if (-not $seen.Add($name)) { continue }
+            if ($name -like 'api-ms-win-*' -or $name -like 'ext-ms-*') { $system.Add($name); continue }
+            if (Test-Path -LiteralPath (Join-Path $system32 $name) -PathType Leaf) { $system.Add($name); continue }
+            $source = Join-Path $toolchainBin $name
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "动态库 $name 既不在 System32，也不在工具链 bin，构件无法独立运行"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path 'build/pkg' $name) -Force
+            $bundled.Add($name)
+            foreach ($dep in Get-DllImports $source) { $pending.Enqueue($dep) }
+          }
+          "系统 DLL（$($system.Count)）：$($system -join ', ')"
+          if ($bundled.Count -gt 0) { "随包运行库（$($bundled.Count)）：$($bundled -join ', ')" }
+          else { '随包运行库：无，全部来自系统' }
+          Set-Content -LiteralPath build/dlls.txt -Value "system=$($system -join ',')" -Encoding utf8
+          Add-Content -LiteralPath build/dlls.txt -Value "bundled=$($bundled -join ',')" -Encoding utf8
+
+      - name: 打包并生成清单
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = 'build/pkg'
+          $payload = @(Get-ChildItem -LiteralPath $pkg -File |
+            Where-Object { $_.Name -notin @('SHA256SUMS.txt', 'BUILD-MANIFEST.json') } |
+            Sort-Object Name)
+          $entries = @(foreach ($f in $payload) {
+            [ordered]@{
+              name = $f.Name
+              size = $f.Length
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLowerInvariant()
+            }
+          })
+          $sums = (($entries | ForEach-Object { "$($_.sha256)  $($_.name)" }) -join [char]10) + [char]10
+          [IO.File]::WriteAllText((Join-Path $PWD "$pkg/SHA256SUMS.txt"), $sums)
+          $sumsFile = Get-Item (Join-Path $pkg 'SHA256SUMS.txt')
+          $entries += [ordered]@{
+            name = $sumsFile.Name
+            size = $sumsFile.Length
+            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sumsFile.FullName).Hash.ToLowerInvariant()
+          }
+          $manifest = [ordered]@{
+            repo = $env:GITHUB_REPOSITORY
+            ref = $env:GITHUB_REF
+            ref_object = $env:SG_REF_OBJECT
+            commit = $env:SG_COMMIT
+            event = $env:GITHUB_EVENT_NAME
+            run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            leaf = 'df53b244383bc79abd3d8a035d4ac29636602444'
+            nim = "$(nim --version | Select-Object -First 1)"
+            gcc = "$(gcc --version | Select-Object -First 1)"
+            target = "$(gcc -dumpmachine)"
+            built_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            files = $entries
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD "$pkg/BUILD-MANIFEST.json"), (($manifest | ConvertTo-Json -Depth 6) + [char]10))
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $zip = Join-Path 'dist' $env:ZIP_NAME
+          Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path (Get-ChildItem -LiteralPath $pkg -File).FullName -DestinationPath $zip -Force
+          $zipSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $PWD "dist/$env:ZIP_NAME.sha256"), (("$zipSha  " + $env:ZIP_NAME) + [char]10))
+          "zip：$env:ZIP_NAME"
+          "zip sha256：$zipSha"
+          Get-Content -LiteralPath (Join-Path $pkg 'BUILD-MANIFEST.json')
+
+      - name: 解压后实测启动
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'shiguang-launch'
+          Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath (Join-Path 'dist' $env:ZIP_NAME) -DestinationPath $root
+          $manifest = Get-Content -LiteralPath (Join-Path $root 'BUILD-MANIFEST.json') -Raw | ConvertFrom-Json
+          $listed = (@($manifest.files.name) | Sort-Object) -join ','
+          $present = (@(Get-ChildItem -LiteralPath $root -File |
+            Where-Object { $_.Name -ne 'BUILD-MANIFEST.json' }).Name | Sort-Object) -join ','
+          if ($listed -ne $present) { throw "解压内容与清单不一致：清单 $listed，实际 $present" }
+          foreach ($entry in $manifest.files) {
+            $file = Get-Item -LiteralPath (Join-Path $root $entry.name)
+            if ($file.Length -ne $entry.size) { throw "$($entry.name) 大小与清单不符" }
+            $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+            if ($sha -ne $entry.sha256) { throw "$($entry.name) 的 SHA-256 与清单不符" }
+          }
+          "解压后的 $($manifest.files.Count) 个文件与清单一致"
+          # 就绪探针按 desktop_win.c 的真实窗口判定：主控窗口由 CreateWindowExW(WS_EX_TOOLWINDOW,
+          # OWNER_CLASS, ..., WS_POPUP, 父窗口 NULL) 创建，是普通隐藏顶层窗口（不是 message-only），
+          # EnumWindows 能枚举到，类名 Shiguang.Controller 也是应用私有的。
+          if (-not ('SgReady' -as [type])) {
+            Add-Type -TypeDefinition @'
+            using System;
+            using System.Runtime.InteropServices;
+            using System.Text;
+
+            public static class SgReady
+            {
+                delegate bool EnumProc(IntPtr h, IntPtr p);
+
+                [DllImport("user32.dll")]
+                static extern bool EnumWindows(EnumProc cb, IntPtr p);
+
+                [DllImport("user32.dll")]
+                static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+
+                [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+                static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+
+                public static int CountClass(uint pid, string wanted)
+                {
+                    int found = 0;
+                    EnumWindows(delegate(IntPtr h, IntPtr p)
+                    {
+                        uint owner;
+                        GetWindowThreadProcessId(h, out owner);
+                        if (owner != pid) return true;
+                        StringBuilder sb = new StringBuilder(256);
+                        GetClassNameW(h, sb, sb.Capacity);
+                        if (sb.ToString() == wanted) found++;
+                        return true;
+                    }, IntPtr.Zero);
+                    return found;
+                }
+
+                public static string Classes(uint pid)
+                {
+                    var names = new StringBuilder();
+                    EnumWindows(delegate(IntPtr h, IntPtr p)
+                    {
+                        uint owner;
+                        GetWindowThreadProcessId(h, out owner);
+                        if (owner != pid) return true;
+                        StringBuilder sb = new StringBuilder(256);
+                        GetClassNameW(h, sb, sb.Capacity);
+                        if (names.Length > 0) names.Append(", ");
+                        names.Append(sb.ToString());
+                        return true;
+                    }, IntPtr.Zero);
+                    return names.ToString();
+                }
+            }
+          '@
+          }
+          $savedPath = $env:PATH
+          $process = $null
+          try {
+            # 隔离 PATH：只留 System32，证明构件不依赖 MinGW bin 或开发机环境。
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            $process = Start-Process -FilePath (Join-Path $root 'shiguang.exe') -WorkingDirectory $root -PassThru
+            $deadline = (Get-Date).AddSeconds(40)
+            $ready = $false
+            while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Milliseconds 500
+              if ($process.HasExited) { throw ("启动后立即退出，退出码 0x{0:X8}" -f $process.ExitCode) }
+              if ([SgReady]::CountClass([uint32]$process.Id, 'Shiguang.Controller') -gt 0) { $ready = $true; break }
+            }
+            if (-not $ready) {
+              $classes = [SgReady]::Classes([uint32]$process.Id)
+              throw "40 秒内未创建主窗口 Shiguang.Controller，构件未进入就绪状态（该进程顶层窗口类：$classes）"
+            }
+            if ($process.HasExited) { throw '就绪检查期间进程退出' }
+            "就绪：进程 $($process.Id) 已在解压目录创建主窗口，PATH 仅含 System32"
+          }
+          finally {
+            $env:PATH = $savedPath
+            if ($process -and -not $process.HasExited) { $process.Kill() }
+            if ($process -and -not $process.WaitForExit(15000)) { throw "无法在 15 秒内结束测试进程 $($process.Id)" }
+            if ($process) { $process.Dispose() }
+          }
+
+      # 微软复核期间只测试、构建，不对外分发二进制。
+      - name: 保存构件
+        if: vars.SHIGUANG_DISTRIBUTION_APPROVED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: shiguang-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-dev:
+    name: 发布开发版预发布（每个 main 提交一个，不可变）
+    needs: build
+    if: vars.SHIGUANG_DISTRIBUTION_APPROVED == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.deleted != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    # 按提交隔离并发：同一提交的重跑串行，不同提交互不排队，避免中间提交的发布被丢弃。
+    concurrency:
+      group: publish-dev-${{ github.sha }}
+      cancel-in-progress: false
+    steps:
+      - name: 检出发布脚本
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 取回本次构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: shiguang-windows-x64
+          path: dist
+
+      - name: 校验并发布开发版
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/publish.sh dev
+
+  publish-release:
+    name: 发布正式版本
+    needs: build
+    if: vars.SHIGUANG_DISTRIBUTION_APPROVED == 'true' && github.event_name == 'push' && github.event.deleted != true && github.ref_type == 'tag' && !startsWith(github.ref_name, 'dev-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: 检出发布脚本
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 取回本次构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: shiguang-windows-x64
+          path: dist
+
+      - name: 校验并发布正式版本
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/publish.sh release

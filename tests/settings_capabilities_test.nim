@@ -1,11 +1,19 @@
 import leaf
 import leaf/backend
+import leaf/styles
+import std/options
 import leaf/backends/win32/capabilities
 import ../src/settings_view
 
 proc captions(node: Node): seq[string] =
-  if node.text.len > 0: result.add(node.text)
+  if node.text.len > 0 and node.key != "startup-status": result.add(node.text)
   for child in node.children: result.add(captions(child))
+
+proc find(node: Node, key: string): Node =
+  if node.key == key: return node
+  for child in node.children:
+    let match = find(child, key)
+    if match != nil: return match
 
 let win32 = win32Capabilities(shadcnLight)
 for (chord, recording, status, trayReady, expected, absent) in [
@@ -13,9 +21,16 @@ for (chord, recording, status, trayReady, expected, absent) in [
     (0x0f20'u32, false, "", true, @["Ctrl", "Alt", "Shift", "Win", "Space", "更改"], @["未注册"]),
     (0'u32, false, "", false, @["未注册", "●  通知区域图标不可用", "更改"], @["Ctrl"]),
     (0x0653'u32, true, "", true, @["请按下新组合键  ·  Esc 取消", "取消录入"], @["Ctrl", "更改"]),
-    (0x0653'u32, false, "此组合键无效或已被占用，未更改。", true,
-      @["Ctrl", "Shift", "S", "此组合键无效或已被占用，未更改。"], @["取消录入"])]:
+    (0x0653'u32, false, shortcutFeedback(1, 0x0653), true,
+      @["Ctrl", "Shift", "S", "ⓘ  新组合键已被占用，仍使用 Ctrl + Shift + S。", "重新录入"],
+      @["取消录入", "更改"])]:
   let view = settingsView(chord, recording, status, trayReady, nil, nil)
+  let minimize = find(view, "minimize")
+  let close = find(view, "close")
+  doAssert minimize != nil and close != nil, "independent accessible caption buttons"
+  doAssert minimize.text == "最小化" and close.text == "关闭"
+  doAssert minimize.styles == close.styles
+  doAssert find(view, "change").styles == find(view, "quit").styles
   let tree = mount(view)
   discard checkCapabilities(tree, win32, compatible)
   discard checkCapabilities(tree, win32, strict)
@@ -23,3 +38,23 @@ for (chord, recording, status, trayReady, expected, absent) in [
   for text in expected: doAssert text in labels, text
   for text in absent: doAssert text notin labels, text
 echo "5 Settings views passed the Leaf Win32 capability check"
+doAssert shortcutFeedback(1, 0) == "新组合键已被占用，当前没有可用快捷键。"
+doAssert shortcutFeedback(2, 0x0653) == "无法保存新组合键，仍使用 Ctrl + Shift + S。"
+doAssert shortcutFeedback(3, 0x0653) == "新组合键无效，仍使用 Ctrl + Shift + S。"
+
+for (state, error, expected) in [
+    (0.cint, false, "未注册"),
+    (1.cint, false, "已注册，实际启动由 Windows 设置或策略决定"),
+    (2.cint, false, "已有其他路径的同名启动项，未改动"),
+    (3.cint, false, "无法读取启动项状态"),
+    (0.cint, true, "无法更新启动项。当前：未注册")]:
+  let view = settingsView(0x0653'u32, false, "", true, nil, nil,
+    startup = state, startupError = error)
+  discard checkCapabilities(mount(view), win32, strict)
+  let control = find(view, "startup")
+  doAssert control.text == "登录 Windows 时启动拾光"
+  let props = normalizeProps(control)
+  doAssert props.control.checked.get == (state == 1)
+  doAssert props.control.enabled.get == (state < 2)
+  doAssert find(view, "startup-status").text == expected
+echo "5 Startup views passed the Leaf Win32 capability check"

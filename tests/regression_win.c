@@ -311,6 +311,21 @@ static void verify_export_pixels(const Image *image) {
     GlobalFree(dib);
 }
 
+static void theme_test(void) {
+    const UiPalette light = ui_palette(FALSE, FALSE), dark = ui_palette(TRUE, FALSE);
+    const UiPalette hc_light = ui_palette(FALSE, TRUE), hc_dark = ui_palette(TRUE, TRUE);
+    assert(light.surface == RGB(253, 251, 245) && dark.surface == RGB(37, 40, 36));
+    assert(light.surface != dark.surface && light.ink != dark.ink);
+    assert(light.accent == dark.accent && light.active != dark.active);
+    assert(hc_light.surface == GetSysColor(COLOR_WINDOW) && hc_dark.surface == hc_light.surface);
+    assert(hc_dark.ink == GetSysColor(COLOR_WINDOWTEXT) && hc_dark.active == GetSysColor(COLOR_HIGHLIGHT));
+    assert(hc_dark.active_ink == GetSysColor(COLOR_HIGHLIGHTTEXT) && hc_dark.accent == hc_light.accent);
+    UiFace hc_plain = ui_primary_face(&hc_dark, false), hc_pressed = ui_primary_face(&hc_dark, true);
+    assert(hc_plain.fill == GetSysColor(COLOR_WINDOW) && hc_plain.ink == GetSysColor(COLOR_WINDOWTEXT));
+    assert(hc_pressed.fill == GetSysColor(COLOR_HIGHLIGHT) && hc_pressed.ink == GetSysColor(COLOR_HIGHLIGHTTEXT));
+    assert(palette[0] == RGB(233, 74, 68) && palette[1] == RGB(28, 113, 208));
+}
+
 static void render_test(void) {
     unsigned char raw[32 * 24 * 4] = {0};
     raw[3] = 255; // An opaque black source pixel must stay opaque.
@@ -351,6 +366,7 @@ static void release_into_editor(void) {
 }
 
 static void edit_test(void) {
+    theme_test();
     render_test();
     recent = (Image){1, 1, malloc(4)};
     assert(recent.bgra);
@@ -368,6 +384,22 @@ static void edit_test(void) {
     editor_action(ACT_REDO);
     assert(IsWindowEnabled(toolbar.buttons[ACT_UNDO]) && !IsWindowEnabled(toolbar.buttons[ACT_REDO]));
 
+    // Force real panel/overlay paints in all modes without changing system preferences.
+    assert(flush_overlays());
+    size_t bytes = image_bytes(canvas.image.width, canvas.image.height);
+    unsigned char *before = malloc(bytes);
+    assert(before);
+    memcpy(before, canvas.image.bgra, bytes);
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        ui_colors = ui_palette(mode == 1, mode == 2);
+        invalidate_theme_windows();
+        assert(flush_overlays());
+        assert(RedrawWindow(toolbar.window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN));
+        assert(!memcmp(before, canvas.image.bgra, bytes));
+    }
+    Image frozen_render = {canvas.image.width, canvas.image.height, before};
+    verify_export_pixels(&frozen_render);
+
     save_result = S_FALSE;
     editor_action(ACT_SAVE);
     assert(phase == EDITING && history.used == 1 && recent.bgra == old);
@@ -375,13 +407,14 @@ static void edit_test(void) {
     editor_action(ACT_SAVE);
     assert(phase == EDITING && history.used == 1 && recent.bgra == old);
     copy_succeeds = FALSE;
-    expected_copy = &canvas.image;
+    expected_copy = &frozen_render;
     editor_action(ACT_COPY);
     assert(phase == EDITING && history.used == 1 && copies == 1 && recent.bgra == old);
     copy_succeeds = TRUE;
     SendMessageW(toolbar.buttons[ACT_COPY], WM_KEYDOWN, VK_RETURN, 0);
     assert(phase == IDLE && recent.bgra && (uintptr_t)recent.bgra != old_address && copies == 2 && recent.width == 70);
     expected_copy = NULL;
+    free(before);
 
     unsigned char *copied = recent.bgra;
     release_into_editor();

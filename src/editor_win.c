@@ -11,6 +11,36 @@ const COLORREF palette[COLORS] = {
     RGB(255, 191, 38), RGB(36, 49, 65), RGB(255, 255, 255)
 };
 
+UiPalette ui_colors;
+
+UiPalette ui_palette(BOOL dark, BOOL high_contrast) {
+    if (high_contrast) return (UiPalette){
+        .surface = GetSysColor(COLOR_WINDOW), .ink = GetSysColor(COLOR_WINDOWTEXT),
+        .muted = GetSysColor(COLOR_GRAYTEXT), .edge = GetSysColor(COLOR_WINDOWTEXT),
+        .hover = GetSysColor(COLOR_HOTLIGHT), .active = GetSysColor(COLOR_HIGHLIGHT),
+        .active_ink = GetSysColor(COLOR_HIGHLIGHTTEXT), .pressed = GetSysColor(COLOR_HIGHLIGHT),
+        .accent = GetSysColor(COLOR_HIGHLIGHT),
+        .focus = GetSysColor(COLOR_HIGHLIGHT), .hint = GetSysColor(COLOR_WINDOW),
+        .hint_ink = GetSysColor(COLOR_WINDOWTEXT), .warning = GetSysColor(COLOR_WINDOWTEXT),
+        .high_contrast = TRUE
+    };
+    return ui_normal_palette(dark != FALSE);
+}
+
+BOOL refresh_ui_palette(void) {
+    HIGHCONTRASTW contrast = {.cbSize = sizeof contrast};
+    BOOL hc = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof contrast, &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON);
+    DWORD light = 1, bytes = sizeof light;
+    BOOL dark = RegGetValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, NULL, &light, &bytes) == ERROR_SUCCESS && !light;
+    UiPalette next = ui_palette(dark, hc);
+    BOOL changed = !ui_palette_equal(&ui_colors, &next);
+    ui_colors = next;
+    return changed;
+}
+
 int canvas_open(Canvas *c, const Image *base) {
     BITMAPINFO info = {.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER), .biWidth = base->width,
         .biHeight = -base->height, .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB}};
@@ -155,12 +185,19 @@ static void draw_icon(const DRAWITEMSTRUCT *item, const Panel *p) {
                     action == ACT_RED + p->color;
     SelectObject(dc, GetStockObject(DC_PEN));
     SelectObject(dc, GetStockObject(DC_BRUSH));
-    SetDCPenColor(dc, RGB(218, 226, 235));
-    SetDCBrushColor(dc, selected || (item->itemState & ODS_SELECTED) ?
-                    RGB(229, 239, 254) : RGB(252, 253, 255));
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, 7, 7);
-    COLORREF ink = item->itemState & ODS_DISABLED ? RGB(159, 174, 191) :
-                   selected ? RGB(24, 101, 190) : RGB(53, 73, 96);
+    POINT cursor;
+    BOOL hot = item->hwndItem && GetCursorPos(&cursor) && WindowFromPoint(cursor) == item->hwndItem;
+    BOOL active = selected || (item->itemState & ODS_SELECTED);
+    BOOL disabled = (item->itemState & ODS_DISABLED) != 0;
+    active = active && !disabled;
+    const UiPalette *c = &ui_colors;
+    SetDCBrushColor(dc, c->surface);
+    FillRect(dc, &r, GetStockObject(DC_BRUSH));
+    COLORREF face = active ? c->active : hot && !disabled && !c->high_contrast ? c->hover : c->surface;
+    SetDCPenColor(dc, face);
+    SetDCBrushColor(dc, face);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, 12, 12);
+    COLORREF ink = disabled ? c->muted : active ? c->active_ink : c->ink;
     int size = r.right - r.left;
     HPEN pen = CreatePen(PS_SOLID, size >= 50 ? 2 : 1, ink);
     if (pen) SelectObject(dc, pen);
@@ -219,6 +256,10 @@ static void draw_icon(const DRAWITEMSTRUCT *item, const Panel *p) {
         break;
     }
     }
+    if (item->itemState & ODS_FOCUS) {
+        InflateRect(&r, -2, -2);
+        DrawFocusRect(dc, &r);
+    }
     RestoreDC(dc, saved);
     if (pen) DeleteObject(pen);
 }
@@ -227,6 +268,12 @@ static LRESULT CALLBACK panel_button_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp
                                           UINT_PTR id, DWORD_PTR ref) {
     (void)ref;
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(w, panel_button_proc, id);
+    if (msg == WM_MOUSEMOVE) {
+        TRACKMOUSEEVENT track = {.cbSize = sizeof track, .dwFlags = TME_LEAVE, .hwndTrack = w};
+        TrackMouseEvent(&track);
+        InvalidateRect(w, NULL, FALSE);
+    }
+    if (msg == WM_MOUSELEAVE) InvalidateRect(w, NULL, FALSE);
     if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
         (wp == VK_ESCAPE || wp == VK_RETURN || (wp == 'S' && GetKeyState(VK_CONTROL) < 0))) {
         HWND overlay = GetAncestor(w, GA_ROOTOWNER);
@@ -245,6 +292,38 @@ static LRESULT CALLBACK panel_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     Panel *p = (Panel *)GetWindowLongPtrW(w, GWLP_USERDATA);
     if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps = {0};
+        HDC dc = BeginPaint(w, &ps);
+        if (dc) {
+            RECT r;
+            GetClientRect(w, &r);
+            SelectObject(dc, GetStockObject(DC_BRUSH));
+            SelectObject(dc, GetStockObject(DC_PEN));
+            SetDCBrushColor(dc, ui_colors.surface);
+            SetDCPenColor(dc, ui_colors.edge);
+            int dpi = (int)GetDpiForWindow(w);
+            int radius = MulDiv(20, dpi, 96);
+            if (r.right < radius || r.bottom < radius) Rectangle(dc, 0, 0, r.right, r.bottom);
+            else RoundRect(dc, 0, 0, r.right, r.bottom, radius, radius);
+            // Separate colors, history, and export without individual button borders.
+            if (p && p->buttons[ACT_COPY] && GetDlgCtrlID(p->buttons[0]) == ACT_SHAPES + 1) {
+                for (int i = ACT_UNDO; i <= ACT_SAVE; i += ACT_SAVE - ACT_UNDO) {
+                    RECT left, right;
+                    if (!GetWindowRect(p->buttons[i-1], &left) || !GetWindowRect(p->buttons[i], &right) ||
+                        left.top != right.top || right.left <= left.right + 2) continue;
+                    POINT at = {(left.right + right.left) / 2, right.top};
+                    if (!ScreenToClient(w, &at)) continue;
+                    int inset = MulDiv(5, dpi, 96);
+                    MoveToEx(dc, at.x, at.y+inset, NULL);
+                    LineTo(dc, at.x, at.y + right.bottom-right.top-inset);
+                }
+            }
+            EndPaint(w, &ps);
+        }
+        return 0;
+    }
     if (msg == WM_DRAWITEM && p && lp) {
         draw_icon((const DRAWITEMSTRUCT *)lp, p);
         return TRUE;
@@ -258,8 +337,9 @@ static LRESULT CALLBACK panel_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 BOOL register_panel(HINSTANCE instance) {
+    refresh_ui_palette();
     WNDCLASSW wc = {.lpfnWndProc = panel_proc, .hInstance = instance, .lpszClassName = PANEL_CLASS,
-        .hCursor = LoadCursorW(NULL, IDC_ARROW), .hbrBackground = (HBRUSH)(COLOR_WINDOW + 1)};
+        .hCursor = LoadCursorW(NULL, IDC_ARROW)};
     return RegisterClassW(&wc) != 0;
 }
 
@@ -271,6 +351,12 @@ BOOL open_panel(Panel *p, HINSTANCE instance, HWND owner, Dock d, int first, int
         PANEL_CLASS, L"截图标注", WS_POPUP, b.left, b.top, b.right-b.left, b.bottom-b.top,
         owner, NULL, instance, p);
     if (!p->window) return FALSE;
+    int dpi = (int)GetDpiForWindow(p->window);
+    int radius = d.cell >= 24 ? MulDiv(20, dpi, 96) : 0;
+    if (radius) {
+        HRGN corner = CreateRoundRectRgn(0, 0, b.right-b.left+1, b.bottom-b.top+1, radius, radius);
+        if (corner && !SetWindowRgn(p->window, corner, FALSE)) DeleteObject(corner);
+    }
     HWND tip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, NULL,
         WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT,
         CW_USEDEFAULT, CW_USEDEFAULT, p->window, NULL, instance, NULL);
@@ -281,7 +367,7 @@ BOOL open_panel(Panel *p, HINSTANCE instance, HWND owner, Dock d, int first, int
             close_panel(p);
             return FALSE;
         }
-        int pad = d.cell >= 24 ? 2 : 0;
+        int pad = d.cell >= 24 ? (d.cell >= 40 ? 4 : 2) : 0;
         HWND button = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             i % d.cols * d.cell + pad, i / d.cols * d.cell + pad, d.cell - 2*pad,
             d.cell - 2*pad, p->window, (HMENU)(intptr_t)(action + 1), instance, NULL);
@@ -334,6 +420,9 @@ HICON shiguang_icon(int size) {
     free(mask_bits);
     HICON icon = NULL;
     if (color && mask && pixels) {
+        COLORREF surface = ui_colors.accent;
+        COLORREF stroke = ui_colors.high_contrast ? ui_colors.active_ink : RGB(255, 255, 247);
+        #define ICON_BGRA(c) (0xff000000u | ((uint32_t)GetRValue(c) << 16) | ((uint32_t)GetGValue(c) << 8) | GetBValue(c))
         uint32_t *px = pixels;
         for (int j = 0; j < size; ++j) for (int i = 0; i < size; ++i) {
             int x = i*32/size, y = j*32/size;
@@ -342,9 +431,9 @@ HICON shiguang_icon(int size) {
             BOOL outline = (xx >= 6 && xx <= 8 && yy >= 6 && yy <= 13) ||
                            (yy >= 6 && yy <= 8 && xx >= 6 && xx <= 13);
             BOOL dot = (x-16)*(x-16) + (y-16)*(y-16) <= 11;
-            px[j*size+i] = dx*dx+dy*dy > 46 ? 0u : outline || dot ? 0xfff1f8ffu :
-                (uint32_t)(0xff000000u | ((40-y/2)<<16) | ((143-y)<<8) | (222-y));
+            px[j*size+i] = dx*dx+dy*dy > 46 ? 0u : outline || dot ? ICON_BGRA(stroke) : ICON_BGRA(surface);
         }
+        #undef ICON_BGRA
         ICONINFO iconinfo = {.fIcon = TRUE, .hbmMask = mask, .hbmColor = color};
         icon = CreateIconIndirect(&iconinfo);
     }

@@ -10,6 +10,7 @@ int sg_start(void);  // 0 started, 1 already running, -1 fatal error
 void sg_stop(void);
 int sg_bind_settings(HWND window);
 void sg_settings_caption(int close);
+void sg_style_settings(void);
 void sg_ready(int background);
 int sg_startup_state(void);  // 0 absent, 1 ours, 2 other installation, 3 unreadable
 int sg_set_startup(int enable);  // 1 success

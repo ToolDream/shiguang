@@ -1,20 +1,24 @@
 # 测试与验收
 
-自动测试分三层，共 18 项：C 逻辑 6 项、设置视图能力检查 5 项、Windows 平台回归 7 项。命令都在仓库根目录执行（Windows 命令用 PowerShell）。
+自动测试分三层，共 27 项：C 逻辑 9 项、设置视图能力检查 10 项（快捷键 5 项、登录启动 5 项）、Windows 平台回归 8 项。命令都在仓库根目录执行（Windows 命令用 PowerShell）。
 
-## 1. C 逻辑测试（6 项）
+## 1. C 逻辑测试（9 项）
 
-平台无关，Linux、macOS、WSL 或 MinGW 都可运行。裁切 3 项覆盖反向拖选、跨屏拼接、空选区与异常尺寸拒绝；编辑 3 项覆盖历史、工具栏布局与热键编码。
+平台无关，Linux、macOS、WSL 或 MinGW 都可运行。裁切 3 项覆盖反向拖选、跨屏拼接、空选区与异常尺寸拒绝；编辑 3 项覆盖历史、工具栏布局与热键编码；调色板 3 项检查主要按钮在明暗两套配色下（常态与按下）的对比度都不低于 4.5:1，并确认调色板每个字段变化都会让缓存失效。
+
+调色板测试用到 `pow` / `fmax` / `fmin`，因此在 glibc 与 macOS 上要加 `-lm`；mingw-w64 的 `libm.a` 是空桩，math 来自 msvcrt 与 `libmingwex`，`-lm` 在 Windows 上同样可加。
 
 ~~~sh
 out=$(mktemp -d)
 cc -std=c11 -Wall -Wextra -Werror tests/crop_test.c src/crop.c -o "$out/crop-test" &&
   "$out/crop-test" &&
   cc -std=c11 -Wall -Wextra -Werror tests/editor_test.c src/editor.c src/crop.c -o "$out/editor-test" &&
-  "$out/editor-test"
+  "$out/editor-test" &&
+  cc -std=c11 -Wall -Wextra -Werror tests/ui_palette_test.c -o "$out/ui-palette-test" -lm &&
+  "$out/ui-palette-test"
 ~~~
 
-## 2. 设置视图能力检查（5 项）
+## 2. 设置视图能力检查（10 项）
 
 需要 Nim 与相邻的 Leaf 源码。用 Leaf 的 Win32 能力表检查五种设置视图：默认键帽、全修饰键组合、未注册且托盘不可用、录入中、冲突反馈。同时检查登录启动的五种视图状态。这是构建期的静态合同检查，不是 Windows 运行结果。
 
@@ -22,7 +26,7 @@ cc -std=c11 -Wall -Wextra -Werror tests/crop_test.c src/crop.c -o "$out/crop-tes
 nim c -r --path:../leaf/src --nimcache:build/nimcache --out:build/settings_capabilities_test tests/settings_capabilities_test.nim
 ~~~
 
-## 3. Windows 平台回归（7 项）
+## 3. Windows 平台回归（8 项）
 
 需 Windows x64 交互桌面。用例不改动用户剪贴板或实际启动项；`startup` 只在当前用户的临时测试键内验证默认、启停、权限失败和非自有项保留。另有 `preview`、`edit`、`save-edit` 会短暂显示遮罩，`replace` 会临时注册组合键，`settings-caption` 会临时创建设置窗口并最小化、关闭它。
 
@@ -51,8 +55,8 @@ foreach ($case in 'save', 'hotkey', 'preview', 'replace', 'edit', 'save-edit', '
 
 以下为最近一轮现场验证的结果（内部快照 r6），仅在单屏远程桌面环境执行。
 
-- 本机（非 Windows）：裁切 3 项与编辑 3 项在 ASan/UBSan 下通过；设置视图 5 项通过能力合同检查。
-- Windows 单屏远程桌面：7 项回归全部退出码 0。
+- 本机（非 Windows）：裁切 3 项与编辑 3 项在 ASan/UBSan 下通过；快捷键和登录启动视图各 5 项通过能力合同检查；调色板 3 项（本轮新增）在本机实跑通过，明暗两套配色的对比度为 8.66:1 / 7.41:1 / 7.14:1 / 5.64:1。
+- Windows 单屏远程桌面：r6 快照的 7 项回归全部退出码 0；随后的 r7 快照补齐 `startup`，8 项回归同样全部退出码 0（应用 SHA-256 `230cded2a5cf458fce0e808f499e01c20da507c385bd84f855e4de120dfe73d`，回归程序 `bd04e944c9d9c8609015d59a0abcc4ebea503c0a9abf01a2f158d9f0329d1564`）。
 - 同一会话的实际应用：从托盘打开设置，键帽、「更改」与标题栏按钮可用，最小化后可还原，「关闭」只隐藏并可再次从托盘打开；录入已被占用的组合时保留原快捷键，按钮变为「重新录入」并显示「ⓘ 新组合键已被占用，仍使用 Ctrl + Shift + S。」；Esc 可取消录入；UIA 点位探测能命中「最小化」「关闭」「更改」「退出拾光」，但该会话的无障碍树遍历失败（MSAA 返回 `0x80004002`，UIA 报 `Unexpected caption`），键盘焦点与悬停效果以现场截图留存。
 - 退出应用后，在另一程序中粘贴得到 537×199 图像。快捷键持久化路径本轮未改，沿用前序实测（重启后键帽与全局热键仍为所设组合）。
 - 另存与 PNG 导出逻辑本轮未改，沿用同一导出逻辑的前序实测：重定向盘与本地磁盘 PNG 均可解码（415×199、419×197），同名目标不被覆盖（34 字节原文件保留）。

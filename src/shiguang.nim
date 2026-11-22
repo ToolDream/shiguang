@@ -28,6 +28,7 @@ proc sg_hotkey(): uint32
 proc sg_set_hotkey(chord: uint32): cint
 proc sg_record_hotkey(recording: cint): cint {.discardable.}
 proc sg_settings_caption(action: cint)
+proc sg_style_settings()
 proc sg_exit()
 proc sg_fatal(message: cstring)
 {.pop.}
@@ -103,7 +104,7 @@ let Settings = defineComponent[tuple[], State[SettingsState]]("Settings",
 
 proc runSettingsHost(background: bool): int =
   let application = app(Settings, title = settingsTitle, width = 574, height = 375)
-    .withNativeTheme(shadcnLight)
+    .withNativeTheme(shadcnLight) # Native control semantics and metrics; application chrome follows Windows.
   defer:
     recordKey = nil
     trayState = nil
@@ -120,6 +121,7 @@ proc runSettingsHost(background: bool): int =
     let finish = recordKey
     try:
       runtime.uiTask(proc() = finish(chord))
+      sg_style_settings()
     except Exception as error:
       settingsError = error
       sg_exit()
@@ -127,7 +129,9 @@ proc runSettingsHost(background: bool): int =
   hostCalls.showWindow = proc(window: HWND, command: int32): BOOL = 0
   let dispatchMessage = hostCalls.dispatchMessage
   hostCalls.dispatchMessage = proc(message: ptr MSG): LRESULT =
+    let before = runtime.acceptedRevision
     result = dispatchMessage(message)
+    if runtime.acceptedRevision != before: sg_style_settings()
     sg_after_dispatch()
   let dialogMessage = hostCalls.dialogMessage
   hostCalls.dialogMessage = proc(root: HWND, message: ptr MSG): BOOL =
@@ -140,13 +144,16 @@ proc runSettingsHost(background: bool): int =
         try:
           let ready = message.wParam != 0
           runtime.uiTask(proc() = trayState(ready))
+          sg_style_settings()
         except Exception as error:
           settingsError = error
           sg_exit()
       return 1
     if message.hwnd != root and (message.hwnd == nil or isChild(root, message.hwnd) == 0):
       return 0
-    dialogMessage(root, message)
+    let before = runtime.acceptedRevision
+    result = dialogMessage(root, message)
+    if runtime.acceptedRevision != before: sg_style_settings()
   let window = createHost(application.title,
     DipSize(width: float64(application.width), height: float64(application.height)),
     calls = hostCalls, theme = application.nativeTheme)
@@ -159,6 +166,7 @@ proc runSettingsHost(background: bool): int =
   window.setSafeTick(proc() = native.safeListTurn())
   if sg_bind_settings(window.windowHandle()) == 0:
     raise newException(OSError, "无法绑定设置窗口。")
+  sg_style_settings()
   sg_ready(cint(background))
   result = window.pump()
   if settingsError != nil: raise settingsError

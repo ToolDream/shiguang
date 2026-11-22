@@ -135,6 +135,41 @@ static BOOL add_tray(void) {
     return FALSE;
 }
 
+static void invalidate_theme_windows(void) {
+    if (settings) RedrawWindow(settings, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    if (toolbar.window) RedrawWindow(toolbar.window, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    if (popup.window) RedrawWindow(popup.window, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    if (text_input) InvalidateRect(text_input, NULL, TRUE);
+    for (size_t i = 0; i < layout.count; ++i)
+        if (surfaces[i].window) InvalidateRect(surfaces[i].window, NULL, FALSE);
+}
+
+static void sync_ui_theme(void) {
+    if (!refresh_ui_palette()) return;
+    HICON next_small = shiguang_icon(GetSystemMetrics(SM_CXSMICON));
+    HICON next_large = shiguang_icon(GetSystemMetrics(SM_CXICON));
+    if (next_small && next_large) {
+        if (settings) {
+            SendMessageW(settings, WM_SETICON, ICON_SMALL, (LPARAM)next_small);
+            SendMessageW(settings, WM_SETICON, ICON_BIG, (LPARAM)next_large);
+        }
+        if (tray_ready) {
+            NOTIFYICONDATAW data = tray_data();
+            data.uFlags = NIF_ICON;
+            data.hIcon = next_small;
+            Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+        if (small_icon) DestroyIcon(small_icon);
+        if (large_icon) DestroyIcon(large_icon);
+        small_icon = next_small;
+        large_icon = next_large;
+    } else {
+        if (next_small) DestroyIcon(next_small);
+        if (next_large) DestroyIcon(next_large);
+    }
+    invalidate_theme_windows();
+}
+
 static BOOL register_hotkey(int id, uint32_t chord) {
     return RegisterHotKey(owner, id, (chord >> 8) | MOD_NOREPEAT, chord & 255);
 }
@@ -450,6 +485,30 @@ static void invalidate_selection(Rect r) {
     }
 }
 
+static void position_hint(BOOL editing) {
+    invalidate_selection(escape_hint);
+    escape_hint = (Rect){0};
+    if (rect_empty(selection)) return;
+    for (size_t i = 0; i < layout.count; ++i) {
+        Rect b = frames[i].bounds;
+        if (selection.left < b.left || selection.left >= b.right || selection.top > b.bottom) continue;
+        int dpi = (int)GetDpiForWindow(surfaces[i].window);
+        if (!dpi) dpi = 96;
+        int w = MulDiv(editing ? 136 : 108, dpi, 96), h = MulDiv(24, dpi, 96);
+        int gap = MulDiv(5, dpi, 96);
+        int x = selection.left, y = selection.top - h - gap;
+        if (b.right - b.left < w || b.bottom - b.top < h) continue;
+        if (x > b.right - w) x = b.right - w;
+        if (y < b.top) y = b.top + gap;
+        if (y > b.bottom - h) continue;
+        Rect hint = {x, y, x + w, y + h};
+        if (editing && !rect_empty(intersect_rect(hint, bar_dock.bounds))) continue;
+        escape_hint = hint;
+        invalidate_selection(hint);
+        break;
+    }
+}
+
 static BOOL pointer_position(HWND window, LPARAM lp, POINT *p) {
     // Normally use the queued event point, not the cursor position after mouse release.
     // shortcut: for >32767 px extents Windows packs/truncates WM_MOUSE coordinates;
@@ -467,6 +526,7 @@ static BOOL update_selection(HWND window, LPARAM lp) {
         invalidate_selection(selection);
         selection = next;
         invalidate_selection(selection);
+        position_hint(FALSE);
     }
     return TRUE;
 }
@@ -515,9 +575,9 @@ static BOOL draw_preview(HDC dc, const RECT *dirty, size_t i) {
         }
         return RestoreDC(dc, saved_clip) && ok;
     }
-    HBRUSH border = GetStockObject(WHITE_BRUSH);
-    return border &&
-        (selected.left != selection.left || FillRect(dc, &(RECT){l, t, l + 1, bot}, border)) &&
+    if (!ui_colors.high_contrast) return TRUE;
+    HBRUSH border = GetSysColorBrush(COLOR_HIGHLIGHT);
+    return (selected.left != selection.left || FillRect(dc, &(RECT){l, t, l + 1, bot}, border)) &&
         (selected.right != selection.right || FillRect(dc, &(RECT){r - 1, t, r, bot}, border)) &&
         (selected.top != selection.top || FillRect(dc, &(RECT){l, t, r, t + 1}, border)) &&
         (selected.bottom != selection.bottom || FillRect(dc, &(RECT){l, bot - 1, r, bot}, border));
@@ -525,20 +585,25 @@ static BOOL draw_preview(HDC dc, const RECT *dirty, size_t i) {
 
 static void paint_escape_hint(HDC dc, size_t i) {
     Rect b = frames[i].bounds;
-    if (!base.bgra || rect_empty(intersect_rect(b, escape_hint))) return;
+    if (rect_empty(intersect_rect(b, escape_hint))) return;
     RECT box = {escape_hint.left - b.left, escape_hint.top - b.top,
                 escape_hint.right - b.left, escape_hint.bottom - b.top};
     int saved = SaveDC(dc);
     if (!saved) return;
     SelectObject(dc, GetStockObject(DC_BRUSH));
-    SelectObject(dc, GetStockObject(NULL_PEN));
-    SetDCBrushColor(dc, RGB(28, 47, 65));
-    RoundRect(dc, box.left, box.top, box.right, box.bottom, 8, 8);
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SetDCBrushColor(dc, ui_colors.hint);
+    SetDCPenColor(dc, ui_colors.high_contrast ? ui_colors.ink : ui_colors.hint);
+    int radius = (box.bottom - box.top) / 3;
+    RoundRect(dc, box.left, box.top, box.right, box.bottom, radius, radius);
     HFONT font = mark_font((box.bottom - box.top) / 2);
     if (font) SelectObject(dc, font);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(247, 252, 255));
-    DrawTextW(dc, L"Esc  取消", -1, &box, DT_VCENTER | DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SetTextColor(dc, ui_colors.hint_ink);
+    wchar_t label[64];
+    if (swprintf(label, ARRAYSIZE(label), base.bgra ? L"%d × %d  ·  Esc" : L"%d × %d",
+        selection.right - selection.left, selection.bottom - selection.top) > 0)
+        DrawTextW(dc, label, -1, &box, DT_VCENTER | DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
     RestoreDC(dc, saved);
     if (font) DeleteObject(font);
 }
@@ -842,20 +907,7 @@ static void begin_editor(HWND focus) {
         SetFocus(focus);
         if (escape_registered && UnregisterHotKey(owner, HOTKEY_CANCEL)) escape_registered = FALSE;
     }
-    for (size_t i = 0; i < layout.count; ++i) {
-        Rect b = frames[i].bounds;
-        if (selection.left < b.left || selection.left >= b.right || selection.top > b.bottom) continue;
-        UINT hint_dpi = GetDpiForWindow(surfaces[i].window);
-        if (!hint_dpi) hint_dpi = 96;
-        int w = MulDiv(88, (int)hint_dpi, 96), h = MulDiv(26, (int)hint_dpi, 96);
-        int x = selection.left, y = selection.top - h - MulDiv(6, (int)hint_dpi, 96);
-        if (x > b.right - w || y < b.top) continue;
-        Rect hint = {x, y, x + w, y + h};
-        if (!rect_empty(intersect_rect(hint, bar_dock.bounds))) continue;
-        escape_hint = hint;
-        invalidate_selection(hint);
-        break;
-    }
+    position_hint(TRUE);
     edit_changed();
     if (!flush_overlays() ||
         !open_panel(&toolbar, instance, surfaces[bar_monitor].window, bar_dock, ACT_SHAPES, BAR_BUTTONS, editor_action)) {
@@ -884,6 +936,13 @@ static LRESULT CALLBACK overlay_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_CTLCOLOREDIT && (HWND)lp == text_input && !ui_colors.high_contrast) {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, ui_colors.ink);
+        SetBkColor(dc, ui_colors.surface);
+        SetDCBrushColor(dc, ui_colors.surface);
+        return (LRESULT)GetStockObject(DC_BRUSH);
+    }
     if (msg == WM_DPICHANGED || msg == WM_DISPLAYCHANGE || msg == WM_CLOSE) {
         cancel_capture();
         return 0;
@@ -972,6 +1031,7 @@ static LRESULT CALLBACK overlay_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 
 static void start_capture(void) {
     if (phase != IDLE || menu_open) return;
+    sync_ui_theme();
     phase = PREPARING;
     layout_invalid = FALSE;
     preview_failed = FALSE;
@@ -1017,18 +1077,21 @@ static void start_capture(void) {
     idle();
 }
 
-enum SettingsFace { SETTINGS_CHANGE = 1, SETTINGS_QUIT, SETTINGS_MIN, SETTINGS_CLOSE, SETTINGS_TITLE, SETTINGS_FEEDBACK };
+enum SettingsFace {
+    SETTINGS_CHANGE = 1, SETTINGS_QUIT, SETTINGS_MIN, SETTINGS_CLOSE, SETTINGS_TITLE,
+    SETTINGS_FEEDBACK, SETTINGS_SWITCH, SETTINGS_KEYCAP, SETTINGS_LABEL, SETTINGS_MUTED
+};
 static HWND settings_title;
 
 static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp,
                                           UINT_PTR id, DWORD_PTR ref) {
-    (void)ref;
     if (msg == WM_NCDESTROY) {
-        if (id == SETTINGS_TITLE) settings_title = NULL;
+        if (ref == SETTINGS_TITLE) settings_title = NULL;
         RemoveWindowSubclass(w, settings_face_proc, id);
     }
+    id = ref;
     if (id == SETTINGS_TITLE && msg == WM_NCHITTEST) return HTTRANSPARENT;
-    if (msg == WM_MOUSEMOVE) {
+    if (msg == WM_MOUSEMOVE && id <= SETTINGS_CLOSE) {
         TRACKMOUSEEVENT track = {.cbSize = sizeof track, .dwFlags = TME_LEAVE, .hwndTrack = w};
         TrackMouseEvent(&track);
         InvalidateRect(w, NULL, FALSE);
@@ -1037,42 +1100,48 @@ static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
         InvalidateRect(w, NULL, FALSE);
     if (msg != WM_PAINT) return DefSubclassProc(w, msg, wp, lp);
 
-    HIGHCONTRASTW contrast = {.cbSize = sizeof contrast};
-    BOOL hc = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof contrast, &contrast, 0) &&
-        (contrast.dwFlags & HCF_HIGHCONTRASTON);
+    const UiPalette *c = &ui_colors;
+    BOOL hc = c->high_contrast;
+    // The same paint path uses explicit system colors in high contrast; Leaf
+    // still owns the native control, its keyboard handling, and its semantics.
     PAINTSTRUCT ps = {0};
     HDC dc = BeginPaint(w, &ps);
     if (dc) {
         RECT r;
         GetClientRect(w, &r);
-        FillRect(dc, &r, GetSysColorBrush(COLOR_WINDOW));
         int saved = SaveDC(dc);
         if (saved) {
             int dpi = (int)GetDpiForWindow(w);
             POINT p;
             BOOL hot = GetCursorPos(&p) && WindowFromPoint(p) == w;
             BOOL pressed = (SendMessageW(w, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
-            COLORREF ink = RGB(46, 67, 87);
+            BOOL disabled = !IsWindowEnabled(w);
+            COLORREF ink = disabled ? c->muted : c->ink;
             SelectObject(dc, GetStockObject(DC_BRUSH));
             SelectObject(dc, GetStockObject(DC_PEN));
-            if (id == SETTINGS_CHANGE || id == SETTINGS_QUIT) {
+            SetDCBrushColor(dc, c->surface);
+            FillRect(dc, &r, GetStockObject(DC_BRUSH));
+            if (id == SETTINGS_CHANGE || id == SETTINGS_QUIT || id == SETTINGS_KEYCAP) {
                 BOOL primary = id == SETTINGS_CHANGE;
-                COLORREF fill = primary ? (pressed ? RGB(205, 224, 244) :
-                    hot ? RGB(219, 234, 250) : RGB(231, 241, 251)) :
-                    pressed ? RGB(229, 239, 249) : hot ? RGB(245, 249, 252) : RGB(255, 255, 255);
-                SetDCBrushColor(dc, hc ? GetSysColor(hot ? COLOR_HIGHLIGHT : COLOR_WINDOW) : fill);
-                SetDCPenColor(dc, hc ? GetSysColor(COLOR_WINDOWTEXT) : RGB(194, 213, 232));
+                BOOL system_highlight = hc && !disabled && id != SETTINGS_KEYCAP && (hot || pressed);
+                UiFace face = primary ? ui_primary_face(c, pressed || system_highlight) :
+                    (UiFace){system_highlight ? c->active :
+                                 !hc && (id == SETTINGS_KEYCAP || (hot && id == SETTINGS_QUIT))
+                                     ? c->hover : c->surface,
+                             system_highlight ? c->active_ink : ink};
+                if (disabled) face = (UiFace){c->surface, c->muted};
+                SetDCBrushColor(dc, face.fill);
+                SetDCPenColor(dc, primary && (hot || pressed) && !hc && !disabled ? c->focus : c->edge);
                 int radius = MulDiv(14, dpi, 96);
                 RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
-                if (primary) ink = RGB(36, 88, 137);
+                ink = face.ink;
             }
-            if (hc) ink = GetSysColor(hot && id != SETTINGS_TITLE ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT);
             if (id == SETTINGS_MIN || id == SETTINGS_CLOSE) {
                 if (hot || pressed) {
-                    SetDCBrushColor(dc, hc ? GetSysColor(COLOR_HIGHLIGHT) :
-                        id == SETTINGS_CLOSE ? RGB(192, 38, 49) : RGB(231, 240, 249));
+                    SetDCBrushColor(dc, hc ? c->active : id == SETTINGS_CLOSE ? RGB(192, 38, 49) : c->hover);
                     FillRect(dc, &r, GetStockObject(DC_BRUSH));
-                    if (!hc && id == SETTINGS_CLOSE) ink = RGB(255, 255, 255);
+                    if (hc) ink = c->active_ink;
+                    else if (id == SETTINGS_CLOSE) ink = RGB(255, 255, 255);
                 }
                 SetDCPenColor(dc, ink);
                 int x = r.right / 2, y = r.bottom / 2, a = MulDiv(5, dpi, 96);
@@ -1089,8 +1158,26 @@ static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
                     DrawIconEx(dc, inset, (r.bottom-side)/2, small_icon, side, side, 0, NULL, DI_NORMAL);
                     r.left = inset + side + MulDiv(10, dpi, 96);
                     align = DT_LEFT;
-                } else if (id == SETTINGS_FEEDBACK) {
-                    if (!hc) ink = RGB(134, 82, 25);
+                } else if (id == SETTINGS_SWITCH) {
+                    BOOL on = SendMessageW(w, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                    int h = MulDiv(18, dpi, 96), wide = MulDiv(34, dpi, 96);
+                    int x = MulDiv(2, dpi, 96), y = (r.bottom-h)/2, pad = MulDiv(3, dpi, 96);
+                    BOOL enabled_on = on && !disabled;
+                    COLORREF track = enabled_on ? c->active : hc ? c->surface : c->hover;
+                    COLORREF thumb_ink = enabled_on ? (hc ? c->active_ink : c->focus)
+                        : disabled || !hc ? c->muted : c->ink;
+                    SetDCBrushColor(dc, track);
+                    SetDCPenColor(dc, disabled ? c->muted : enabled_on && !hc ? c->focus : c->edge);
+                    RoundRect(dc, x, y, x+wide, y+h, h, h);
+                    SetDCBrushColor(dc, thumb_ink);
+                    SetDCPenColor(dc, thumb_ink);
+                    int thumb = on ? x+wide-h+pad : x+pad;
+                    Ellipse(dc, thumb, y+pad, thumb+h-2*pad, y+h-pad);
+                    r.left = x+wide+MulDiv(9, dpi, 96);
+                    align = DT_LEFT;
+                } else if (id == SETTINGS_FEEDBACK || id == SETTINGS_LABEL || id == SETTINGS_MUTED) {
+                    if (id == SETTINGS_FEEDBACK) ink = c->warning;
+                    if (id == SETTINGS_MUTED && !hc) ink = c->muted;
                     align = DT_LEFT;
                 }
                 HFONT font = (HFONT)SendMessageW(w, WM_GETFONT, 0, 0);
@@ -1099,11 +1186,22 @@ static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
                 SetTextColor(dc, ink);
                 wchar_t caption[192];
                 int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
-                DrawTextW(dc, caption, n, &r, DT_SINGLELINE | DT_VCENTER | align | DT_NOPREFIX);
+                if (n) DrawTextW(dc, caption, n, &r,
+                    DT_SINGLELINE | DT_VCENTER | align | DT_NOPREFIX | DT_END_ELLIPSIS);
+                else if (r.bottom <= MulDiv(2, dpi, 96)) {
+                    SetDCBrushColor(dc, c->edge);
+                    FillRect(dc, &r, GetStockObject(DC_BRUSH));
+                }
             }
             if (GetFocus() == w && !(SendMessageW(w, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
-                InflateRect(&r, -4, -4);
-                DrawFocusRect(dc, &r);
+                GetClientRect(w, &r);
+                InflateRect(&r, -2, -2);
+                if (hc) DrawFocusRect(dc, &r);
+                else {
+                    SelectObject(dc, GetStockObject(NULL_BRUSH));
+                    SetDCPenColor(dc, c->focus);
+                    RoundRect(dc, r.left, r.top, r.right, r.bottom, 8, 8);
+                }
             }
             RestoreDC(dc, saved);
         }
@@ -1114,9 +1212,9 @@ static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
 
 static BOOL CALLBACK style_settings_controls(HWND w, LPARAM unused) {
     (void)unused;
-    wchar_t klass[16], label[32];
-    if (!GetClassNameW(w, klass, ARRAYSIZE(klass)) ||
-        !GetWindowTextW(w, label, ARRAYSIZE(label))) return TRUE;
+    wchar_t klass[16], label[192] = {0};
+    if (!GetClassNameW(w, klass, ARRAYSIZE(klass))) return TRUE;
+    int n = GetWindowTextW(w, label, ARRAYSIZE(label));
     UINT_PTR face = 0;
     if (!wcscmp(klass, L"Button")) {
         if (!wcscmp(label, L"更改") || !wcscmp(label, L"重新录入") || !wcscmp(label, L"取消录入"))
@@ -1124,14 +1222,33 @@ static BOOL CALLBACK style_settings_controls(HWND w, LPARAM unused) {
         else if (!wcscmp(label, L"退出拾光")) face = SETTINGS_QUIT;
         else if (!wcscmp(label, L"最小化")) face = SETTINGS_MIN;
         else if (!wcscmp(label, L"关闭")) face = SETTINGS_CLOSE;
-    } else if (!wcscmp(klass, L"Static") && !wcscmp(label, L"拾光截图 / 设置")) {
-        face = SETTINGS_TITLE;
-        settings_title = w;
-    } else if (!wcscmp(klass, L"Static") && (!wcscmp(label, L" ") || label[0] == L'ⓘ')) {
-        face = SETTINGS_FEEDBACK;
+        else if (!wcscmp(label, L"登录 Windows 时启动拾光")) face = SETTINGS_SWITCH;
+    } else if (!wcscmp(klass, L"Static")) {
+        if (!wcscmp(label, L"拾光截图 / 设置")) {
+            face = SETTINGS_TITLE;
+            settings_title = w;
+        } else if (label[0] == L'ⓘ' || !wcsncmp(label, L"无法", 2) || !wcsncmp(label, L"已有", 2))
+            face = SETTINGS_FEEDBACK;
+        else if ((n == 1 && ((label[0] >= L'A' && label[0] <= L'Z') ||
+                  (label[0] >= L'0' && label[0] <= L'9') || wcschr(L"←↑→↓", label[0]))) ||
+                 (n >= 2 && n <= 3 && label[0] == L'F' && label[1] >= L'1' && label[1] <= L'9') ||
+                 !wcscmp(label, L"Ctrl") || !wcscmp(label, L"Alt") || !wcscmp(label, L"Shift") ||
+                 !wcscmp(label, L"Win") || !wcscmp(label, L"Space") || !wcscmp(label, L"PgUp") ||
+                 !wcscmp(label, L"PgDn") || !wcscmp(label, L"End") || !wcscmp(label, L"Home") ||
+                 !wcscmp(label, L"Ins") || !wcscmp(label, L"Del")) face = SETTINGS_KEYCAP;
+        else if (!wcscmp(label, L"区域截图快捷键") || !wcscmp(label, L"+") ||
+                 !wcsncmp(label, L"请按", 2)) face = SETTINGS_LABEL;
+        else face = SETTINGS_MUTED;
     }
-    if (face) SetWindowSubclass(w, settings_face_proc, face, 0);
+    if (face) SetWindowSubclass(w, settings_face_proc, 1, face);
     return TRUE;
+}
+
+void sg_style_settings(void) {
+    if (settings) {
+        EnumChildWindows(settings, style_settings_controls, 0);
+        RedrawWindow(settings, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
 }
 
 void sg_settings_caption(int close) {
@@ -1145,6 +1262,15 @@ static LRESULT CALLBACK settings_subclass(HWND w, UINT msg, WPARAM wp, LPARAM lp
         BOOL cancel = recording_hotkey;
         sg_record_hotkey(0);
         if (cancel) PostMessageW(w, SG_RECORD_MESSAGE, 0, 0);
+    }
+    if (msg == WM_ERASEBKGND) {
+        RECT r;
+        GetClientRect(w, &r);
+        HDC dc = (HDC)wp;
+        COLORREF old = SetDCBrushColor(dc, ui_colors.surface);
+        FillRect(dc, &r, GetStockObject(DC_BRUSH));
+        SetDCBrushColor(dc, old);
+        return 1;
     }
     if (msg == WM_NCHITTEST && settings_title && !IsIconic(w)) {
         LRESULT hit = DefSubclassProc(w, msg, wp, lp);
@@ -1186,7 +1312,8 @@ int sg_bind_settings(HWND w) {
 
 static void show_settings(void) {
     if (!settings) return;
-    EnumChildWindows(settings, style_settings_controls, 0);
+    sync_ui_theme();
+    sg_style_settings();
     ShowWindow(settings, IsIconic(settings) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(settings);
     PostMessageW(settings, SG_TRAY_MESSAGE, (WPARAM)tray_ready, 0);
@@ -1240,6 +1367,11 @@ static LRESULT CALLBACK owner_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             } else start_capture();
         }
         return 0;
+    case WM_SETTINGCHANGE:
+    case WM_SYSCOLORCHANGE:
+    case WM_THEMECHANGED:
+        sync_ui_theme();
+        break;
     case WM_DISPLAYCHANGE:
         cancel_capture();
         return 0;
@@ -1294,9 +1426,10 @@ int sg_start(void) {
     instance = GetModuleHandleW(NULL);
     INITCOMMONCONTROLSEX controls = {.dwSize = sizeof controls, .dwICC = ICC_WIN95_CLASSES};
     if (!InitCommonControlsEx(&controls)) return -1;
+    if (!register_panel(instance)) return -1;
     small_icon = shiguang_icon(GetSystemMetrics(SM_CXSMICON));
     large_icon = shiguang_icon(GetSystemMetrics(SM_CXICON));
-    if (!small_icon || !large_icon || !register_panel(instance)) return -1;
+    if (!small_icon || !large_icon) return -1;
     taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSW controller = {.lpfnWndProc = owner_proc, .hInstance = instance, .lpszClassName = OWNER_CLASS};
     WNDCLASSW overlay = {.lpfnWndProc = overlay_proc, .hInstance = instance, .lpszClassName = CAPTURE_CLASS,

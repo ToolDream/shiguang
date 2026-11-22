@@ -73,7 +73,7 @@ jobs:
           gcc --version
           gcc -dumpmachine
 
-      - name: C 逻辑测试 6 项
+      - name: C 逻辑测试 9 项
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force build | Out-Null
@@ -85,6 +85,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'editor_test 编译失败' }
           ./build/editor_test.exe
           if ($LASTEXITCODE -ne 0) { throw 'editor_test 失败' }
+          # 调色板测试用到 pow/fmax/fmin：glibc 需要 -lm；mingw-w64 的 libm.a 是空桩，
+          # math 实现来自 msvcrt 与 libmingwex，-lm 在 Windows 上同样可用。
+          gcc -std=c11 -Wall -Wextra -Werror tests/ui_palette_test.c -o build/ui_palette_test.exe -lm
+          if ($LASTEXITCODE -ne 0) { throw 'ui_palette_test 编译失败' }
+          ./build/ui_palette_test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'ui_palette_test 失败' }
 
       - name: 设置视图能力检查（含登录启动）
         shell: pwsh

@@ -3,6 +3,12 @@
 #include <windows.h>
 #include "editor.h"
 
+#include "ui_palette.h"
+
+extern UiPalette ui_colors;
+UiPalette ui_palette(BOOL dark, BOOL high_contrast);
+BOOL refresh_ui_palette(void);
+
 typedef struct {
     HDC dc;
     HBITMAP dib;

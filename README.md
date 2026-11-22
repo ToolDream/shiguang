@@ -1,4 +1,12 @@
+<p align="center">
+  <img src="docs/images/logo.png" width="112" height="112" alt="拾光图标：蓝色圆角底上的白色光芒与小光点">
+</p>
+
 # 拾光截图
+
+> 拾起一点光，随手解决一件小事。
+
+「光点」图标用白色光芒与小光点呼应「拾光」，蓝色圆角底保持简洁、轻盈。它不绑定截图功能：拾光目前从截图开始，未来希望成为常驻电脑的日常小工具集合。
 
 常驻 Windows 通知区域的截图工具：全局热键呼出，框选后就地标注，按 **Enter** 复制、**Ctrl + S** 另存 PNG。
 
@@ -29,12 +37,12 @@
 
 ![标注界面设计稿：桌面遮罩上画有红色圈注，工具栏含形状、箭头、画笔、文字、颜色与撤销重做](docs/images/annotation.png)
 
-![设置窗口设计稿：区域截图快捷键 Ctrl + Shift + S 键帽与「重新录入」按钮，并显示组合键冲突提示](docs/images/settings.png)
+![设置窗口设计稿：光点图标、常规与软件更新分组，包含更新通道、自动下载开关和「重启更新」按钮](docs/images/settings.png)
 
-两张均为设计稿（设置图为冲突状态预览），**不是 Windows 运行截图**。
+两张均为设计稿，**不是 Windows 运行截图**。设置图展示更新下载完成、等待重启的状态；版本号为示例。当前源码已接入自动更新；公开下载包能否自动更新仍取决于签名发布，Windows 实际更新链尚待验收。首次启用时需手动安装支持更新的整套便携包。
 
 ## 下载与文档
 
-[下载 Windows x64 开发版](https://github.com/ToolDream/shiguang/releases)：选择最新的开发预发布，下载 `shiguang-windows-x64.zip`。
+[下载 Windows x64 开发版](https://github.com/ToolDream/shiguang/releases)：新流水线交付后，选择固定的 `dev-latest` 预发布，下载 `shiguang-windows-x64.zip`。
 
 [使用指南](docs/usage.md) · [环境与构建](docs/build.md) · [测试与验收](docs/testing.md) · [构建与发布流水线](docs/release.md) · [MIT 许可证](LICENSE)

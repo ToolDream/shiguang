@@ -23,6 +23,7 @@ jobs:
       - name: 检出拾光源码
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: 检出固定提交的 Leaf
@@ -106,22 +107,67 @@ jobs:
             throw '未出现登录启动能力检查通过行'
           }
 
-      - name: 构建 Windows x64 可执行文件
+      - name: 自动更新策略、验签、后台服务和安装事务
         shell: pwsh
         run: |
-          nim c -d:release --cc:gcc --app:gui --path:leaf/src --nimcache:build/nimcache --out:build/shiguang.exe src/shiguang.nim
+          foreach ($case in 'policy', 'package', 'service', 'install', 'win_handshake') {
+            nim c -r "--nimcache:build/update-$case" "--out:build/update_${case}_test.exe" "tests/update_${case}_test.nim"
+            if ($LASTEXITCODE -ne 0) { throw "自动更新测试失败：$case" }
+          }
+
+      - name: 核实自动更新构建身份
+        shell: pwsh
+        env:
+          SG_UPDATE_PUBLIC_KEY: ${{ vars.SG_UPDATE_PUBLIC_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $order = '0'
+          $tag = ''
+          if ($env:GITHUB_REPOSITORY -ceq 'ToolDream/shiguang') {
+            if ($env:GITHUB_REF -ceq 'refs/heads/main') {
+              $tag = 'dev-' + $env:SG_COMMIT.Substring(0, 12)
+            } elseif ($env:GITHUB_REF.StartsWith('refs/tags/')) {
+              $tag = $env:GITHUB_REF.Substring(10)
+              if ($tag -cnotmatch '^v(?:0|[1-9][0-9]{0,9})(?:\.(?:0|[1-9][0-9]{0,9})){2}$') {
+                throw '正式自动更新 tag 必须为 vMAJOR.MINOR.PATCH'
+              }
+            }
+          }
+          if ($tag) {
+            $order = bash scripts/update_source_order.sh $env:SG_COMMIT
+            if ($LASTEXITCODE -ne 0 -or $order -notmatch '^[1-9][0-9]*$') {
+              throw '无法核实构建属于 main 第一父链'
+            }
+          }
+          $key = $env:SG_UPDATE_PUBLIC_KEY
+          if ($key -and $key -cnotmatch '^[0-9a-f]{128}$') { throw 'SG_UPDATE_PUBLIC_KEY 格式错误' }
+          "SG_UPDATE_ORDER=$order" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "SG_UPDATE_TAG=$tag" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "SG_UPDATE_PUBLIC_KEY=$key" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 构建 Windows x64 可执行文件和更新助手
+        shell: pwsh
+        run: |
+          $defs = @("-d:UpdateOrder=$env:SG_UPDATE_ORDER", "-d:UpdateRevision=$env:SG_COMMIT")
+          if ($env:SG_UPDATE_TAG) { $defs += "-d:UpdateTag=$env:SG_UPDATE_TAG" }
+          if ($env:SG_UPDATE_PUBLIC_KEY) { $defs += "-d:UpdatePublicKey=$env:SG_UPDATE_PUBLIC_KEY" }
+          windres -I src -i src/shiguang.rc -o build/shiguang-icon.o
+          if ($LASTEXITCODE -ne 0) { throw '拾光图标资源构建失败' }
+          nim c -d:release @defs --cc:gcc --app:gui --passL:build/shiguang-icon.o --path:leaf/src --nimcache:build/nimcache --out:build/shiguang.exe src/shiguang.nim
           if ($LASTEXITCODE -ne 0) { throw '拾光截图构建失败' }
+          nim c -d:release @defs --cc:gcc --app:gui --nimcache:build/helper-cache --out:build/shiguang-updater.exe src/updater_helper.nim
+          if ($LASTEXITCODE -ne 0) { throw '拾光更新助手构建失败' }
           $exe = Get-Item build/shiguang.exe -ErrorAction SilentlyContinue
           if (-not $exe -or $exe.Length -le 0) { throw 'build/shiguang.exe 缺失或为空' }
           "shiguang.exe 大小：$($exe.Length) 字节"
 
       # 链接库与 r6 现场实测一致：desktop_win.c 的标题栏按钮没有引入新的 Win32 库。
-      - name: 平台回归 8 项
+      - name: 平台回归 9 项
         shell: pwsh
         run: |
-          gcc -std=c11 -D_WIN32_WINNT=0x0a00 tests/regression_win.c src/crop.c src/editor.c src/editor_win.c -o build/regression_win.exe -luser32 -lgdi32 -lmsimg32 -ldwmapi -lcomctl32 -lshell32 -ladvapi32 -lole32 -luuid -lwindowscodecs
+          gcc -std=c11 -D_WIN32_WINNT=0x0a00 tests/regression_win.c src/crop.c src/editor.c src/editor_win.c build/shiguang-icon.o -o build/regression_win.exe -luser32 -lgdi32 -lmsimg32 -ldwmapi -lcomctl32 -lshell32 -ladvapi32 -lole32 -luuid -lwindowscodecs
           if ($LASTEXITCODE -ne 0) { throw '回归程序构建失败' }
-          foreach ($case in 'save', 'hotkey', 'preview', 'replace', 'edit', 'save-edit', 'settings-caption', 'startup') {
+          foreach ($case in 'save', 'hotkey', 'preview', 'replace', 'edit', 'save-edit', 'settings-caption', 'startup', 'update-busy') {
             "== regression_win $case =="
             ./build/regression_win.exe $case
             $code = $LASTEXITCODE
@@ -136,6 +182,7 @@ jobs:
           $system32 = Join-Path $env:SystemRoot 'System32'
           $toolchainBin = Split-Path (Get-Command gcc).Source -Parent
           New-Item -ItemType Directory -Force build/pkg | Out-Null
+          Copy-Item -LiteralPath build/shiguang-updater.exe -Destination build/pkg/shiguang-updater.exe -Force
           Copy-Item -LiteralPath build/shiguang.exe -Destination build/pkg/shiguang.exe -Force
 
           $cache = @{}
@@ -150,6 +197,12 @@ jobs:
             return $names
           }
 
+          foreach ($name in Get-DllImports (Join-Path 'build/pkg' 'shiguang-updater.exe')) {
+            if ($name -notlike 'api-ms-win-*' -and $name -notlike 'ext-ms-*' -and
+                -not (Test-Path -LiteralPath (Join-Path $system32 $name) -PathType Leaf)) {
+              throw "更新助手有非系统依赖 $name，不能从独立工作目录启动"
+            }
+          }
           $pending = [System.Collections.Generic.Queue[string]]::new()
           foreach ($name in Get-DllImports (Join-Path 'build/pkg' 'shiguang.exe')) { $pending.Enqueue($name) }
           $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -202,6 +255,9 @@ jobs:
             repo = $env:GITHUB_REPOSITORY
             ref = $env:GITHUB_REF
             ref_object = $env:SG_REF_OBJECT
+            update_tag = [string]$env:SG_UPDATE_TAG
+            update_order = [string]$env:SG_UPDATE_ORDER
+            update_public_key = [string]$env:SG_UPDATE_PUBLIC_KEY
             commit = $env:SG_COMMIT
             event = $env:GITHUB_EVENT_NAME
             run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
@@ -216,7 +272,8 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           $zip = Join-Path 'dist' $env:ZIP_NAME
           Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-          Compress-Archive -Path (Get-ChildItem -LiteralPath $pkg -File).FullName -DestinationPath $zip -Force
+          python scripts/update_release.py pack $pkg $zip
+          if ($LASTEXITCODE -ne 0) { throw '更新 ZIP 打包失败' }
           $zipSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
           [IO.File]::WriteAllText((Join-Path $PWD "dist/$env:ZIP_NAME.sha256"), (("$zipSha  " + $env:ZIP_NAME) + [char]10))
           "zip：$env:ZIP_NAME"
@@ -347,21 +404,22 @@ jobs:
           retention-days: 14
 
   publish-dev:
-    name: 发布开发版预发布（每个 main 提交一个，不可变）
+    name: 更新唯一开发版预发布（dev-latest）
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
-    # 按提交隔离并发：同一提交的重跑串行，不同提交互不排队，避免中间提交的发布被丢弃。
+    # 跨 SHA 串行；真正切换前再次核对当前 main 和已签源码顺序。
     concurrency:
-      group: publish-dev-${{ github.sha }}
+      group: publish-dev-latest
       cancel-in-progress: false
     steps:
       - name: 检出发布脚本
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: 取回本次构建产物
@@ -370,12 +428,17 @@ jobs:
           name: shiguang-windows-x64
           path: dist
 
+      - name: 离线验证滚动发布状态机
+        run: python3 -B tests/update_rolling_test.py
+
       - name: 校验并发布开发版
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SG_UPDATE_PUBLIC_KEY: ${{ vars.SG_UPDATE_PUBLIC_KEY }}
+          SG_UPDATE_SIGNING_KEY: ${{ secrets.SG_UPDATE_SIGNING_KEY }}
         run: bash scripts/publish.sh dev
 
   publish-release:
@@ -393,6 +456,7 @@ jobs:
       - name: 检出发布脚本
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: 取回本次构建产物
@@ -407,4 +471,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
           REF: ${{ github.ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SG_UPDATE_PUBLIC_KEY: ${{ vars.SG_UPDATE_PUBLIC_KEY }}
+          SG_UPDATE_SIGNING_KEY: ${{ secrets.SG_UPDATE_SIGNING_KEY }}
         run: bash scripts/publish.sh release

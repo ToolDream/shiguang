@@ -3,7 +3,7 @@
 ## 环境
 
 - 运行：Windows x64（Windows 10 1703 或更新）。
-- 编译：Nim **2.2.6+**，PATH 中可用的 x64 MinGW-w64 GCC，以及 [Leaf](https://github.com/SatoriTours/Leaf) 源码。
+- 编译：Nim **2.2.6+**，PATH 中可用的 x64 MinGW-w64 GCC 和 windres，以及 [Leaf](https://github.com/SatoriTours/Leaf) 源码。
 - Leaf 固定为 `0.1.0` 提交 `df53b244383bc79abd3d8a035d4ac29636602444`，无需修改。本地开发把 Leaf 放在相邻目录 `../leaf`；流水线检出到仓库内 `leaf/`，对应命令用 `--path:leaf/src`。
 
 ## 架构
@@ -11,7 +11,7 @@
 | 文件 | 职责 |
 | --- | --- |
 | `src/shiguang.nim` | 应用入口、设置窗口状态与消息循环接线 |
-| `src/settings_view.nim` | 设置界面视图：快捷键键帽、标题栏按钮、录入反馈文案 |
+| `src/settings_view.nim` | 设置界面视图：常规、快捷键、登录启动和软件更新 |
 | `src/desktop_win.c` | 托盘、全局热键、设置窗口标题栏、桌面遮罩、选区交互 |
 | `src/editor.c` / `src/editor_win.c` | 标注模型与历史、工具栏布局、Win32 编辑窗口 |
 | `src/export_win.c` | 剪贴板 DIB 与 WIC PNG 导出、原子落盘 |
@@ -27,7 +27,9 @@
 
 ~~~powershell
 New-Item -ItemType Directory -Force build | Out-Null
-nim c -d:release --cc:gcc --app:gui --path:../leaf/src --nimcache:build/nimcache --out:build/shiguang.exe src/shiguang.nim
+windres -I src -i src/shiguang.rc -o build/shiguang-icon.o
+if ($LASTEXITCODE -ne 0) { throw "拾光图标资源构建失败" }
+nim c -d:release --cc:gcc --app:gui --passL:build/shiguang-icon.o --path:../leaf/src --nimcache:build/nimcache --out:build/shiguang.exe src/shiguang.nim
 if ($LASTEXITCODE -ne 0) { throw "拾光截图构建失败" }
 .\build\shiguang.exe
 ~~~
@@ -39,6 +41,12 @@ git -C ../leaf rev-parse HEAD
 ~~~
 
 输出应为 `df53b244383bc79abd3d8a035d4ac29636602444`。
+
+## 光点图标
+
+窗口、托盘和 EXE 使用资源 `src/shiguang.ico`。常规构建直接嵌入此资源，不需要 SVG 工具。设计更新时，从仓库根目录运行 `python3 scripts/generate_icon.py`，用 `rsvg-convert` 将 `docs/images/logo.svg` 导出为 16–256 px 的九个尺寸。复现当前资源使用 librsvg 2.62.3 / Cairo 1.18.4；不同渲染器版本可能改变 PNG 编码。
+
+没有传入构建身份的本地产物显示「当前版本 未知」。本地构建不会自动获得发布签名信任，见 [更新后端接线](update_backend.md) 与 [发布流水线](release.md)。
 
 ## 与流水线一致的构建环境
 

@@ -1,6 +1,6 @@
 # 测试与验收
 
-自动测试分三层，共 33 项：C 逻辑 14 项、设置视图能力检查 11 项（快捷键 5 项、登录启动 6 项）、Windows 平台回归 8 项。命令都在仓库根目录执行（Windows 命令用 PowerShell）。
+本文列出 C 逻辑、设置视图和 Windows 平台回归。更新服务、签名发布合同与更新助手用例由 [Windows 构建工作流](../.github/workflows/build.yml) 单独执行。命令都在仓库根目录执行（Windows 命令用 PowerShell）。
 
 ## 1. C 逻辑测试（14 项）
 
@@ -18,23 +18,25 @@ cc -std=c11 -Wall -Wextra -Werror tests/crop_test.c src/crop.c -o "$out/crop-tes
   "$out/ui-palette-test"
 ~~~
 
-## 2. 设置视图能力检查（11 项）
+## 2. 设置视图合同
 
-需要 Nim 与相邻的 Leaf 源码。用 Leaf 的 Win32 能力表检查五种设置视图：默认键帽、全修饰键组合、未注册且托盘不可用、录入中、冲突反馈。同时检查登录启动的六种视图状态。这是构建期的静态合同检查，不是 Windows 运行结果。
+需要 Nim 与相邻的 Leaf 源码。用 Leaf 的 Win32 能力表检查五种设置视图：默认键帽、全修饰键组合、未注册且托盘不可用、录入中、冲突反馈。同时检查登录启动的六种视图状态。另外核对更新首屏、自动下载关闭时发现版本、下载中、就绪、检查和下载失败、通道切换、控件回调、真实设置写入失败与 96/144 DPI 布局边界。这是视图合同检查，不是 Windows 运行结果。
 
 ~~~sh
 nim c -r --path:../leaf/src --nimcache:build/nimcache --out:build/settings_capabilities_test tests/settings_capabilities_test.nim
 ~~~
 
-## 3. Windows 平台回归（8 项）
+## 3. Windows 平台回归（9 项）
 
-需 Windows x64 交互桌面。用例不改动用户剪贴板或实际启动项；`startup` 只在当前用户的临时测试键内验证默认、启停、权限失败和非自有项保留。另有 `preview`、`edit`、`save-edit` 会短暂显示遮罩，`replace` 会临时注册组合键，`settings-caption` 会临时创建设置窗口并最小化、关闭它。
+需 Windows x64 交互桌面。用例不改动用户剪贴板或实际启动项；`startup` 只在当前用户的临时测试键内验证默认、启停、权限失败和非自有项保留。另有 `preview`、`edit`、`save-edit` 会短暂显示遮罩，`replace` 会临时注册组合键，`settings-caption` 会临时创建设置窗口，校验 EXE 和窗口的图标资源，并最小化、关闭它。`update-busy` 检查忙态的重启门禁。
 
 ~~~powershell
 New-Item -ItemType Directory -Force build | Out-Null
-gcc -std=c11 -D_WIN32_WINNT=0x0a00 tests/regression_win.c src/crop.c src/editor.c src/editor_win.c -o build/regression_win.exe -luser32 -lgdi32 -lmsimg32 -ldwmapi -lcomctl32 -lshell32 -ladvapi32 -lole32 -luuid -lwindowscodecs
+windres -I src -i src/shiguang.rc -o build/shiguang-icon.o
+if ($LASTEXITCODE -ne 0) { throw "拾光图标资源构建失败" }
+gcc -std=c11 -D_WIN32_WINNT=0x0a00 tests/regression_win.c src/crop.c src/editor.c src/editor_win.c build/shiguang-icon.o -o build/regression_win.exe -luser32 -lgdi32 -lmsimg32 -ldwmapi -lcomctl32 -lshell32 -ladvapi32 -lole32 -luuid -lwindowscodecs
 if ($LASTEXITCODE -ne 0) { throw "回归程序构建失败" }
-foreach ($case in 'save', 'hotkey', 'preview', 'replace', 'edit', 'save-edit', 'settings-caption', 'startup') {
+foreach ($case in 'save', 'hotkey', 'preview', 'replace', 'edit', 'save-edit', 'settings-caption', 'startup', 'update-busy') {
     .\build\regression_win.exe $case
     if ($LASTEXITCODE -ne 0) { throw "回归失败：$case" }
 }
@@ -51,9 +53,11 @@ foreach ($case in 'save', 'hotkey', 'preview', 'replace', 'edit', 'save-edit', '
 5. 两次启动只出现一个通知区域图标；检查窗口与托盘图标、菜单、键帽、「更改」/「重新录入」及标题栏的「最小化」「关闭」；录入冲突键保留旧值并说明原因，录入可用键后重启核持久化，最后从托盘退出。
 6. 打开登录启动，关窗重开及退出后重启应用，确认登记状态；关闭开关检查登记移除。核启动命令的引号与后台托盘行为；只有真实重新登录才算验证 Windows 自动调度，不为此注销共享测试机。
 
+7. 用 Windows 100% 和 150% DPI、明暗及高对比度主题打开设置，检查常规/软件更新布局、窗口/托盘/资源管理器图标和所有键盘可达控件；用发布签名的测试包检查版本、上次检查、通道、下载状态及两个重启入口，验证忙时拒绝并保留工作、普通退出不安装。静态设计稿和交叉编译结果不能代替这一现场确认。
+
 ## 实测结果
 
-以下为最近一轮现场验证的结果（内部快照 r6），仅在单屏远程桌面环境执行。
+以下是引入自动更新之前的历史现场记录（内部快照 r6/r7），不能作为新设置和更新链的验收依据。
 
 - 本机（非 Windows）：裁切 3 项与编辑 3 项在 ASan/UBSan 下通过；快捷键和登录启动视图各 5 项通过能力合同检查；调色板 3 项（本轮新增）在本机实跑通过，明暗两套配色的对比度为 8.66:1 / 7.41:1 / 7.14:1 / 5.64:1。
 - Windows 单屏远程桌面：r6 快照的 7 项回归全部退出码 0；随后的 r7 快照补齐 `startup`，8 项回归同样全部退出码 0（应用 SHA-256 `230cded2a5cf458fce0e808f499e01c20da507c385bd84f855e4de120dfe73d`，回归程序 `bd04e944c9d9c8609015d59a0abcc4ebea503c0a9abf01a2f158d9f0329d1564`）。

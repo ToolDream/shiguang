@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="780" viewBox="0 0 820 780">
+<rect width="820" height="780" fill="#e9f0f5"/>
+<rect x="42" y="32" width="736" height="704" rx="14" fill="white" stroke="#cbd8e5"/>
+<g font-family="Noto Sans CJK SC" fill="#253e53">
+<svg x="64" y="52" width="26" height="26" viewBox="0 0 128 128">
+  <title id="title">拾光 · 光点</title>
+  <desc id="desc">蓝色圆角底上的白色四角光芒与小光点，寓意拾起一点光，随手解决一件小事。</desc>
+  <defs>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#398ed0"/>
+      <stop offset="1" stop-color="#2265ac"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="29.333" fill="url(#blue)"/>
+  <path d="M60 22 C65 48 73 56 99 61 C73 66 65 74 60 100 C55 74 47 66 21 61 C47 56 55 48 60 22Z" fill="white"/>
+  <circle cx="100" cy="26" r="8" fill="white"/>
+</svg>
+<text x="102" y="72" font-size="17">拾光截图 / 设置</text>
+<path d="M691 65h12m35-6 11 11m0-11-11 11" stroke="#334c61" stroke-width="1.5"/>
+<path d="M42 94h736" stroke="#e1e8ef"/>
+
+<text x="74" y="137" font-size="19" font-weight="bold">常规</text>
+<rect x="74" y="155" width="672" height="144" rx="9" fill="#fff" stroke="#dce4ec"/>
+<text x="94" y="194" font-size="16">区域截图快捷键</text>
+<text x="94" y="218" font-size="13" fill="#8091a1">按下组合键，即可开始框选</text>
+<g fill="#f5f7f9" stroke="#d0dce7"><rect x="416" y="178" width="54" height="36" rx="6"/><rect x="493" y="178" width="59" height="36" rx="6"/><rect x="575" y="178" width="36" height="36" rx="6"/></g>
+<g font-size="15" text-anchor="middle"><text x="443" y="202">Ctrl</text><text x="522" y="202">Shift</text><text x="593" y="202">S</text><text x="482" y="202" fill="#8193a5">+</text><text x="564" y="202" fill="#8193a5">+</text></g>
+<rect x="634" y="178" width="92" height="36" rx="6" fill="#fff" stroke="#cbd8e5"/><text x="680" y="202" text-anchor="middle" font-size="15">更改</text>
+<path d="M94 238h632" stroke="#edf0f4"/>
+<text x="94" y="275" font-size="16">登录 Windows 时启动拾光</text>
+<rect x="680" y="255" width="46" height="25" rx="12.5" fill="#cbd5df"/><circle cx="692.5" cy="267.5" r="9.5" fill="white"/>
+
+<text x="74" y="344" font-size="19" font-weight="bold">软件更新</text>
+<text x="746" y="343" text-anchor="end" font-size="13" fill="#8091a1">当前版本  0.3.0 测试版</text>
+<rect x="74" y="362" width="672" height="158" rx="9" fill="#fff" stroke="#dce4ec"/>
+<text x="94" y="403" font-size="16">更新通道</text>
+<rect x="566" y="379" width="160" height="38" rx="6" fill="white" stroke="#cbd8e5"/>
+<text x="582" y="404" font-size="15">测试版</text><path d="m701 395 5 5 5-5" stroke="#647b90" stroke-width="1.6" fill="none"/>
+<path d="M94 435h632" stroke="#edf0f4"/>
+<text x="94" y="467" font-size="16">自动下载更新</text>
+<text x="94" y="494" font-size="13" fill="#8091a1">每天检查一次，下载完成后由你决定何时重启</text>
+<rect x="680" y="452" width="46" height="25" rx="12.5" fill="#2676b8"/><circle cx="713.5" cy="464.5" r="9.5" fill="white"/>
+
+<rect x="74" y="536" width="672" height="88" rx="9" fill="#f0f7fd" stroke="#d5e6f5"/>
+<circle cx="98" cy="565" r="4" fill="#358a76"/>
+<text x="111" y="572" font-size="16" font-weight="bold">新版本已就绪</text>
+<text x="94" y="600" font-size="13" fill="#647b90">0.3.1 测试版 · 重启后生效</text>
+<rect x="610" y="559" width="116" height="42" rx="7" fill="#2676b8"/>
+<text x="668" y="586" text-anchor="middle" font-size="16" fill="white">重启更新</text>
+<text x="74" y="649" font-size="12" fill="#8b9aa8">最近检查：今天 10:30</text>
+
+<path d="M42 668h736" stroke="#e1e8ef"/>
+<circle cx="79" cy="701" r="4" fill="#438e7d"/>
+<text x="92" y="707" font-size="13" fill="#647b90">托盘运行中 · 关闭窗口不影响截图</text>
+<rect x="642" y="683" width="104" height="36" rx="6" fill="white" stroke="#cbd8e5"/><text x="694" y="707" text-anchor="middle" font-size="15">退出拾光</text>
+<text x="45" y="764" font-size="12" fill="#8193a5">拾光截图 · 设置布局优化稿（非运行截图，版本号为示例）</text>
+</g></svg>

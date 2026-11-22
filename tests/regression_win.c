@@ -9,6 +9,13 @@
 
 static BOOL fail_blit, fail_dib, fail_preview;
 static int copies, blits;
+static HWND observe_preview;
+static BOOL force_present_fallback;
+static int present_blits, present_dibs, window_shades;
+static COLORREF presented_hint, presented_old_hint, presented_inside, presented_outside;
+static POINT hint_sample, old_hint_sample, inside_sample, outside_sample;
+static RECT hint_label;
+static BOOL presented_text;
 static HRESULT save_result;
 static BOOL copy_succeeds = TRUE, persist_succeeds = TRUE;
 static DWORD persisted;
@@ -19,6 +26,21 @@ static unsigned stage_flushes, moves;
 
 static BOOL test_blit(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD op) {
     ++blits;
+    if (observe_preview && WindowFromDC(dst) == observe_preview) {
+        ++present_blits;
+        assert(sx == x && sy == y);
+        presented_hint = GetPixel(src, hint_sample.x, hint_sample.y);
+        presented_inside = GetPixel(src, inside_sample.x, inside_sample.y);
+        presented_outside = GetPixel(src, outside_sample.x, outside_sample.y);
+        presented_text = FALSE;
+        for (LONG row = hint_label.top; row < hint_label.bottom && !presented_text; ++row)
+            for (LONG col = hint_label.left; col < hint_label.right && !presented_text; ++col)
+                presented_text = GetPixel(src, col, row) == ui_colors.hint_ink;
+        if (force_present_fallback) {
+            presented_old_hint = GetPixel(src, old_hint_sample.x, old_hint_sample.y);
+            return FALSE;
+        }
+    }
     if (close_during_blit) {
         HWND w = close_during_blit;
         close_during_blit = NULL;
@@ -31,8 +53,21 @@ static BOOL test_blit(HDC dst, int x, int y, int w, int h, HDC src, int sx, int 
 
 static int test_dib(HDC dst, int x, int y, int w, int h, int sx, int sy, int sw, int sh,
                     const void *bits, const BITMAPINFO *info, UINT usage, DWORD op) {
+    if (observe_preview && WindowFromDC(dst) == observe_preview) {
+        ++present_dibs;
+        assert(sw == w && sh == h && sx == x && sy == y);
+        const uint32_t *pixels = bits;
+        uint32_t pixel = pixels[hint_sample.y * info->bmiHeader.biWidth + hint_sample.x];
+        assert(RGB((pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255) == ui_colors.hint);
+    }
     return fail_dib || (fail_preview && WindowFromDC(dst)) ? GDI_ERROR :
         StretchDIBits(dst, x, y, w, h, sx, sy, sw, sh, bits, info, usage, op);
+}
+
+static BOOL test_alpha_blend(HDC dst, int x, int y, int w, int h, HDC src,
+                             int sx, int sy, int sw, int sh, BLENDFUNCTION blend) {
+    if (observe_preview && WindowFromDC(dst) == observe_preview) ++window_shades;
+    return AlphaBlend(dst, x, y, w, h, src, sx, sy, sw, sh, blend);
 }
 
 static BOOL create_at_publish;
@@ -132,6 +167,7 @@ static SHORT WINAPI test_key_state(int vk) {
 
 #define GetKeyState test_key_state
 #define canvas_open test_canvas_open
+#define AlphaBlend test_alpha_blend
 #define BitBlt test_blit
 #define StretchDIBits test_dib
 #define publish_image count_copy
@@ -143,6 +179,7 @@ static SHORT WINAPI test_key_state(int vk) {
 #undef publish_image
 #undef StretchDIBits
 #undef BitBlt
+#undef AlphaBlend
 #undef canvas_open
 #undef GetKeyState
 
@@ -259,7 +296,7 @@ static HWND small_overlay(void) {
 
 static void assert_shaded(uint32_t color, uint32_t original) {
     for (int shift = 0; shift < 24; shift += 8) {
-        int expected = (int)((original >> shift) & 255u) * 4 / 5;
+        int expected = (int)((original >> shift) & 255u) * 158 / 255;
         int actual = (int)((color >> shift) & 255u);
         assert(abs(expected - actual) <= 1);
     }
@@ -350,6 +387,93 @@ static void selection_preview_test(void) {
     canvas_close(&shade);
 }
 
+static void sample_hint(Rect screen) {
+    RECT box = {escape_hint.left - screen.left, escape_hint.top - screen.top,
+                escape_hint.right - screen.left, escape_hint.bottom - screen.top};
+    assert(box.right > box.left && box.bottom > box.top);
+    hint_sample = (POINT){box.left + 6, (box.top + box.bottom) / 2};
+    // Ignore rounded edges and the contrasting border in high-contrast mode.
+    hint_label = box;
+    InflateRect(&hint_label, -12, -4);
+}
+
+static void preview_frame_test(void) {
+    // Exercise real WM_PAINT with a known frozen monitor, not a live capture.
+    enum { W = 640, H = 400 };
+    const uint32_t frozen = 0xffd0e0f0u;
+    assert(open_shade() && open_preview(W, H));
+    HDC source = CreateCompatibleDC(NULL);
+    BITMAPINFO info = bitmap_info(W, H);
+    void *bits;
+    HBITMAP dib = CreateDIBSection(source, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    assert(source && dib);
+    HGDIOBJ previous = SelectObject(source, dib);
+    assert(previous);
+    uint32_t *pixels = bits;
+    for (int j = 0; j < W * H; ++j) pixels[j] = frozen;
+    HWND w = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, CAPTURE_CLASS, L"", WS_POPUP,
+                             0, 0, W, H, NULL, NULL, instance, NULL);
+    assert(w);
+    POINT origin = {0};
+    assert(ClientToScreen(w, &origin));
+    Rect screen = {origin.x, origin.y, origin.x + W, origin.y + H};
+    layout.count = 1;
+    desktop_bounds = screen;
+    wide_desktop = layout_invalid = preview_failed = FALSE;
+    frames[0] = (Frame){screen, bits};
+    surfaces[0] = (Surface){.dc = source, .bitmap = dib, .previous = previous, .window = w};
+    phase = SELECTING;
+    dragging = TRUE;
+    anchor = (POINT){screen.left + 350, screen.top + 160};
+    ShowWindow(w, SW_SHOWNOACTIVATE);
+    assert(update_selection(w, MAKELPARAM(530, 260)));
+    assert(!rect_empty(escape_hint));
+
+    observe_preview = w;
+    sample_hint(screen);
+    inside_sample = (POINT){450, 200};
+    outside_sample = (POINT){250, 200};
+    assert(UpdateWindow(w) && !preview_failed);
+    assert(present_blits == 1 && !present_dibs && !window_shades);
+    assert(presented_hint == ui_colors.hint && presented_text);
+    const COLORREF original = RGB(0xd0, 0xe0, 0xf0);
+    assert(presented_inside == original);
+    assert_shaded(presented_outside, original);
+
+    // Reverse the drag across the anchor. Both old/new selection and hint must
+    // be invalidated, even though the old hint no longer belongs to the ROI.
+    old_hint_sample = hint_sample;
+    assert(update_selection(w, MAKELPARAM(60, 260)));
+    sample_hint(screen);
+    inside_sample = (POINT){250, 200};
+    outside_sample = (POINT){450, 200};
+    HRGN dirty = CreateRectRgn(0, 0, 0, 0);
+    assert(dirty && GetUpdateRgn(w, dirty, FALSE) != ERROR);
+    assert(PtInRegion(dirty, old_hint_sample.x, old_hint_sample.y) && PtInRegion(dirty, hint_sample.x, hint_sample.y));
+    assert(PtInRegion(dirty, 450, 200) && PtInRegion(dirty, 250, 200));
+    DeleteObject(dirty);
+
+    // The fallback must present that same composed frame without an unshaded
+    // window paint in between.
+    force_present_fallback = TRUE;
+    assert(UpdateWindow(w) && !preview_failed);
+    assert(present_blits == 2 && present_dibs == 1 && !window_shades);
+    assert(presented_hint == ui_colors.hint && presented_text && presented_inside == original);
+    assert_shaded(presented_old_hint, original);
+    assert_shaded(presented_outside, original);
+    force_present_fallback = FALSE;
+    observe_preview = NULL;
+
+    Image cut = {0};
+    assert(crop_frozen(selection, frames, layout.count, &cut) == CROP_OK);
+    assert(cut.width == 290 && cut.height == 100);
+    for (size_t j = 0; j < image_bytes(cut.width, cut.height) / 4; ++j)
+        assert(((uint32_t *)cut.bgra)[j] == frozen);
+    free(cut.bgra);
+    cancel_capture();
+    assert(phase == IDLE && !IsWindow(w) && layout.count == 0 && rect_empty(escape_hint) && !preview.dc);
+}
+
 static void preview_test(void) {
     recent = (Image){1, 1, malloc(4)};
     assert(recent.bgra);
@@ -358,7 +482,7 @@ static void preview_test(void) {
     // A failed first paint must not arm selection.
     fail_preview = TRUE;
     start_capture();
-    assert(phase == IDLE && layout.count == 0 && recent.bgra == previous && !copies && !shade.dc);
+    assert(phase == IDLE && layout.count == 0 && recent.bgra == previous && !copies && !shade.dc && !preview.dc);
     fail_preview = FALSE;
 
     HWND overlay = small_overlay();
@@ -825,6 +949,11 @@ static void save_editor_test(void) {
 }
 
 static void settings_caption_test(void) {
+    // The same icon group must be usable by Explorer and by the window/tray loader.
+    assert(FindResourceW(instance, MAKEINTRESOURCEW(IDI_SHIGUANG), RT_GROUP_ICON));
+    small_icon = load_app_icon(SM_CXSMICON);
+    large_icon = load_app_icon(SM_CXICON);
+    assert(small_icon && large_icon);
     const WNDCLASSW cls = {.lpfnWndProc = DefWindowProcW, .hInstance = instance,
                            .lpszClassName = L"Shiguang.Test.Settings"};
     assert(RegisterClassW(&cls));
@@ -832,6 +961,8 @@ static void settings_caption_test(void) {
         60, 60, 570, 350, NULL, NULL, instance, NULL);
     RECT content, after;
     assert(window && GetClientRect(window, &content) && sg_bind_settings(window));
+    assert((HICON)SendMessageW(window, WM_GETICON, ICON_SMALL, 0) == small_icon);
+    assert((HICON)SendMessageW(window, WM_GETICON, ICON_BIG, 0) == large_icon);
     assert(GetClientRect(window, &after) && EqualRect(&content, &after));
     LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
     assert(!(style & (WS_MAXIMIZEBOX | WS_THICKFRAME | WS_DLGFRAME)));
@@ -874,7 +1005,7 @@ static void settings_caption_test(void) {
     assert(dib);
     HGDIOBJ previous = SelectObject(probe, dib);
     SendMessageW(toggle, WM_PRINTCLIENT, (WPARAM)probe, PRF_CLIENT);
-    COLORREF track = GetPixel(probe, MulDiv(15, dpi, 96), bounds.bottom / 2);
+    COLORREF track = GetPixel(probe, bounds.right - MulDiv(19, dpi, 96), bounds.bottom / 2);
     assert(track == ui_colors.active);
     SelectObject(probe, previous);
     DeleteObject(dib);
@@ -883,6 +1014,14 @@ static void settings_caption_test(void) {
     assert(!IsWindowEnabled(toggle) && SendMessageW(toggle, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
     MSG message;
+    sg_update_set_available(0);
+    SendMessageW(owner, COMMAND_MSG, CMD_UPDATE, 0);
+    assert(!PeekMessageW(&message, window, SG_UPDATE_MESSAGE, SG_UPDATE_MESSAGE, PM_REMOVE));
+    sg_update_set_available(1);
+    SendMessageW(owner, COMMAND_MSG, CMD_UPDATE, 0);
+    assert(PeekMessageW(&message, window, SG_UPDATE_MESSAGE, SG_UPDATE_MESSAGE, PM_REMOVE));
+    assert(message.wParam == 1);
+    sg_update_set_available(0);
     sg_settings_caption(0);
     assert(PeekMessageW(&message, window, WM_SYSCOMMAND, WM_SYSCOMMAND, PM_REMOVE));
     DispatchMessageW(&message);
@@ -947,6 +1086,23 @@ static void startup_test(void) {
     assert(RegDeleteKeyW(HKEY_CURRENT_USER, path) == ERROR_SUCCESS);
 }
 
+static void update_busy_test(void) {
+    assert(phase == IDLE && sg_update_can_restart());
+    for (enum Phase candidate = PREPARING; candidate <= DRAINING; ++candidate) {
+        phase = candidate;
+        assert(!sg_update_can_restart());
+    }
+    phase = IDLE;
+    menu_open = TRUE;
+    assert(!sg_update_can_restart());
+    menu_open = FALSE;
+    // Nonzero hook alone reserves the recorder, before/after actual key input.
+    recording_hook = (HHOOK)(UINT_PTR)1;
+    assert(!sg_update_can_restart());
+    recording_hook = NULL;
+    assert(sg_update_can_restart());
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     assert(SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) ||
@@ -965,12 +1121,13 @@ int main(int argc, char **argv) {
     assert(owner);
     if (!strcmp(argv[1], "save")) save_test();
     else if (!strcmp(argv[1], "hotkey")) hotkey_test();
-    else if (!strcmp(argv[1], "preview")) { preview_test(); selection_preview_test(); }
+    else if (!strcmp(argv[1], "preview")) { preview_test(); selection_preview_test(); preview_frame_test(); }
     else if (!strcmp(argv[1], "replace")) replace_test();
     else if (!strcmp(argv[1], "edit")) edit_test();
     else if (!strcmp(argv[1], "save-edit")) save_editor_test();
     else if (!strcmp(argv[1], "settings-caption")) settings_caption_test();
     else if (!strcmp(argv[1], "startup")) startup_test();
+    else if (!strcmp(argv[1], "update-busy")) update_busy_test();
     else assert(!"unknown Windows regression case");
     sg_stop();
     CoUninitialize();

@@ -2,6 +2,7 @@
 #include "desktop_win.h"
 #include "export_win.h"
 #include "editor_win.h"
+#include "shiguang_icon.h"
 #include <commctrl.h>
 #include <windowsx.h>
 #include <dwmapi.h>
@@ -16,7 +17,8 @@
 #define OWNER_CLASS L"Shiguang.Controller"
 #define CAPTURE_CLASS L"Shiguang.FrozenMonitor"
 enum { TRAY_MSG = WM_APP + 1, COMMAND_MSG, PREVIEW_WAKE, HOTKEY_A = 1, HOTKEY_B = 2, HOTKEY_CANCEL = 3 };
-enum { CMD_CAPTURE = 1, CMD_COPY, CMD_SAVE, CMD_SETTINGS, CMD_EXIT };
+enum { CMD_CAPTURE = 1, CMD_COPY, CMD_SAVE, CMD_SETTINGS, CMD_EXIT, CMD_UPDATE };
+enum { UPDATE_TIMER = 1 };
 enum Phase { IDLE, PREPARING, SELECTING, EDITING, OUTPUT, DRAINING };
 enum { MAX_DISPLAYS = 64 };
 
@@ -35,12 +37,13 @@ typedef struct {
     HBITMAP bitmap;
     HGDIOBJ previous;
     HWND window;
+    HFONT hint_font;
 } Surface;
 
 static HINSTANCE instance;
 static HANDLE single_instance;
 static HWND owner, settings;
-static BOOL com, tray_ready, menu_open;
+static BOOL com, tray_ready, menu_open, update_available;
 static UINT taskbar_created;
 static uint32_t shortcut = HOTKEY_DEFAULT;
 static int active_hotkey;
@@ -59,7 +62,7 @@ static Layout layout;
 static Surface surfaces[MAX_DISPLAYS];
 static Frame frames[MAX_DISPLAYS];
 static Image recent, base;
-static Canvas canvas, shade;
+static Canvas canvas, shade, preview;
 static History history;
 static Mark draft;
 static BOOL drawing, composition_dirty, ime_composing;
@@ -147,30 +150,17 @@ static void invalidate_theme_windows(void) {
         if (surfaces[i].window) InvalidateRect(surfaces[i].window, NULL, FALSE);
 }
 
+static HICON load_app_icon(int metric) {
+    const int side = GetSystemMetrics(metric);
+    return (HICON)LoadImageW(instance, MAKEINTRESOURCEW(IDI_SHIGUANG), IMAGE_ICON,
+                            side, side, LR_DEFAULTCOLOR);
+}
+
 static void sync_ui_theme(void) {
-    if (!refresh_ui_palette()) return;
-    HICON next_small = shiguang_icon(GetSystemMetrics(SM_CXSMICON));
-    HICON next_large = shiguang_icon(GetSystemMetrics(SM_CXICON));
-    if (next_small && next_large) {
-        if (settings) {
-            SendMessageW(settings, WM_SETICON, ICON_SMALL, (LPARAM)next_small);
-            SendMessageW(settings, WM_SETICON, ICON_BIG, (LPARAM)next_large);
-        }
-        if (tray_ready) {
-            NOTIFYICONDATAW data = tray_data();
-            data.uFlags = NIF_ICON;
-            data.hIcon = next_small;
-            Shell_NotifyIconW(NIM_MODIFY, &data);
-        }
-        if (small_icon) DestroyIcon(small_icon);
-        if (large_icon) DestroyIcon(large_icon);
-        small_icon = next_small;
-        large_icon = next_large;
-    } else {
-        if (next_small) DestroyIcon(next_small);
-        if (next_large) DestroyIcon(next_large);
+    if (refresh_ui_palette()) {
+        invalidate_theme_windows();
+        if (settings) PostMessageW(settings, SG_TRAY_MESSAGE, (WPARAM)tray_ready, 0);
     }
-    invalidate_theme_windows();
 }
 
 static BOOL register_hotkey(int id, uint32_t chord) {
@@ -374,6 +364,11 @@ static BOOL open_shade(void) {
     return TRUE;
 }
 
+static BOOL open_preview(int width, int height) {
+    return image_bytes(width, height) &&
+        canvas_open(&preview, &(Image){.width = width, .height = height});
+}
+
 static BOOL freeze_desktop(void) {
     if (!read_layout(&layout)) return FALSE;
     Rect extent = layout.items[0].bounds;
@@ -391,8 +386,15 @@ static BOOL freeze_desktop(void) {
     HDC screen = GetDC(NULL);
     if (!screen) return FALSE;
     BOOL ok = TRUE;
-    for (size_t i = 0; ok && i < layout.count; ++i) ok = create_surface(screen, i);
-    ok = GdiFlush() && ok && open_shade();
+    int max_width = 0, max_height = 0;
+    for (size_t i = 0; ok && i < layout.count; ++i) {
+        Rect b = layout.items[i].bounds;
+        int width = b.right - b.left, height = b.bottom - b.top;
+        if (width > max_width) max_width = width;
+        if (height > max_height) max_height = height;
+        ok = create_surface(screen, i);
+    }
+    ok = GdiFlush() && ok && open_shade() && open_preview(max_width, max_height);
     ReleaseDC(NULL, screen);
     return ok;
 }
@@ -416,6 +418,7 @@ static void close_overlays(void) {
     escape_hint = (Rect){0};
     canvas_close(&canvas);
     canvas_close(&shade);
+    canvas_close(&preview);
     history_clear(&history);
     mark_clear(&draft);
     free(base.bgra);
@@ -434,6 +437,7 @@ static void close_overlays(void) {
     for (size_t i = 0; i < layout.count; ++i) {
         Surface *s = &surfaces[i];
         if (s->window) DestroyWindow(s->window);
+        if (s->hint_font) DeleteObject(s->hint_font);
         if (s->previous) SelectObject(s->dc, s->previous);
         if (s->bitmap) DeleteObject(s->bitmap);
         if (s->dc) DeleteDC(s->dc);
@@ -597,7 +601,7 @@ static BOOL draw_selection_edges(HDC dc, Rect screen, Rect area, Rect dirty) {
 }
 
 static BOOL shade_preview(HDC dc, const RECT *dirty, Rect screen, Rect selected) {
-    const BLENDFUNCTION dim = {AC_SRC_OVER, 0, 51, 0}; // 20% black
+    const BLENDFUNCTION dim = {AC_SRC_OVER, 0, 97, 0}; // 38% black
     int w = dirty->right - dirty->left, h = dirty->bottom - dirty->top;
     if (rect_empty(selected))
         return AlphaBlend(dc, dirty->left, dirty->top, w, h, shade.dc, 0, 0, 1, 1, dim);
@@ -660,7 +664,7 @@ static BOOL draw_preview(HDC dc, const RECT *dirty, size_t i) {
         if (!RestoreDC(dc, saved_clip) || !ok) return FALSE;
     }
     // Composite/export pixels are finalized above; the outline only touches
-    // the preview window DC, including after the selection has been locked.
+    // the preview frame, including after the selection has been locked.
     return draw_selection_edges(dc, b, area, selected);
 }
 
@@ -678,30 +682,60 @@ static void paint_grips(HDC dc, Rect screen) {
     }
 }
 
-static void paint_escape_hint(HDC dc, size_t i) {
+static BOOL paint_escape_hint(HDC dc, size_t i) {
     Rect b = frames[i].bounds;
-    if (rect_empty(intersect_rect(b, escape_hint))) return;
+    if (rect_empty(intersect_rect(b, escape_hint))) return TRUE;
     RECT box = {escape_hint.left - b.left, escape_hint.top - b.top,
                 escape_hint.right - b.left, escape_hint.bottom - b.top};
+    if (!RectVisible(dc, &box)) return TRUE;
     int saved = SaveDC(dc);
-    if (!saved) return;
+    if (!saved) return FALSE;
     SelectObject(dc, GetStockObject(DC_BRUSH));
     SelectObject(dc, GetStockObject(DC_PEN));
     SetDCBrushColor(dc, ui_colors.hint);
     SetDCPenColor(dc, ui_colors.high_contrast ? ui_colors.ink : ui_colors.hint);
     int radius = (box.bottom - box.top) / 3;
-    RoundRect(dc, box.left, box.top, box.right, box.bottom, radius, radius);
-    HFONT font = mark_font((box.bottom - box.top) / 2);
-    if (font) SelectObject(dc, font);
+    BOOL ok = RoundRect(dc, box.left, box.top, box.right, box.bottom, radius, radius);
+    HFONT *font = &surfaces[i].hint_font;
+    // Overlay DPI changes cancel the capture; the hint height is fixed per surface.
+    if (!*font) *font = mark_font((box.bottom - box.top) / 2);
+    if (*font) SelectObject(dc, *font);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, ui_colors.hint_ink);
     wchar_t label[64];
     Rect area = visible_selection();
-    if (swprintf(label, ARRAYSIZE(label), base.bgra ? L"%d × %d  ·  Esc" : L"%d × %d",
-        area.right - area.left, area.bottom - area.top) > 0)
-        DrawTextW(dc, label, -1, &box, DT_VCENTER | DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
-    RestoreDC(dc, saved);
-    if (font) DeleteObject(font);
+    ok = ok && swprintf(label, ARRAYSIZE(label), base.bgra ? L"%d × %d  ·  Esc" : L"%d × %d",
+        area.right - area.left, area.bottom - area.top) > 0 &&
+        DrawTextW(dc, label, -1, &box, DT_VCENTER | DT_CENTER | DT_SINGLELINE | DT_NOPREFIX) != 0;
+    return RestoreDC(dc, saved) && ok;
+}
+
+static BOOL present_preview(HDC dc, const RECT *dirty, size_t i) {
+    const int x = dirty->left, y = dirty->top;
+    const int w = dirty->right - x, h = dirty->bottom - y;
+    if (w <= 0 || h <= 0) return TRUE;
+    if (!preview.dc || x < 0 || y < 0 || dirty->right > preview.image.width ||
+        dirty->bottom > preview.image.height) return FALSE;
+
+    // One reusable monitor-sized scratch frame. All GDI layers, including the
+    // hint and its text, are clipped and composed before touching the window.
+    int saved = SaveDC(preview.dc);
+    if (!saved) return FALSE;
+    BOOL ok = IntersectClipRect(preview.dc, x, y, dirty->right, dirty->bottom) > NULLREGION &&
+        draw_preview(preview.dc, dirty, i) && paint_escape_hint(preview.dc, i);
+    if (ok) paint_grips(preview.dc, frames[i].bounds);
+    if (!RestoreDC(preview.dc, saved) || !ok || !GdiFlush()) return FALSE;
+    if (layout_invalid || preview_failed) return TRUE; // Cancelled during synchronous GDI work.
+
+    // BeginPaint still owns the real (possibly disjoint) update region.
+    if (!BitBlt(dc, x, y, w, h, preview.dc, x, y, SRCCOPY)) {
+        // Across display adapters, use the very same composed DIB, not frozen pixels.
+        BITMAPINFO info = bitmap_info(preview.image.width, preview.image.height);
+        int rows = StretchDIBits(dc, x, y, w, h, x, y, w, h, preview.image.bgra,
+                                 &info, DIB_RGB_COLORS, SRCCOPY);
+        if (rows <= 0) return FALSE;
+    }
+    return GdiFlush();
 }
 
 static void paint_overlay(HWND window, size_t i) {
@@ -710,12 +744,7 @@ static void paint_overlay(HWND window, size_t i) {
     HDC dc = BeginPaint(window, &ps);
     BOOL showing = phase == PREPARING || capture_active() || (phase == OUTPUT && base.bgra);
     if (showing && !preview_failed && !layout_invalid) {
-        if (!dc || i >= layout.count || !draw_preview(dc, &ps.rcPaint, i)) preview_failure();
-        else {
-            paint_escape_hint(dc, i);
-            paint_grips(dc, frames[i].bounds);
-            if (!GdiFlush()) preview_failure();
-        }
+        if (!dc || i >= layout.count || !present_preview(dc, &ps.rcPaint, i)) preview_failure();
     }
     if (dc && !EndPaint(window, &ps) && showing) preview_failure();
     --paint_depth;
@@ -1380,7 +1409,8 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
         } else if (id == SETTINGS_SWITCH) {
             BOOL on = SendMessageW(w, BM_GETCHECK, 0, 0) == BST_CHECKED;
             int h = MulDiv(18, dpi, 96), wide = MulDiv(34, dpi, 96);
-            int x = MulDiv(2, dpi, 96), y = (r.bottom-h)/2, pad = MulDiv(3, dpi, 96);
+            int x = r.right - wide - MulDiv(2, dpi, 96);
+            int y = (r.bottom-h)/2, pad = MulDiv(3, dpi, 96);
             BOOL enabled_on = on && !disabled;
             COLORREF track = enabled_on ? c->active : hc ? c->surface : c->hover;
             COLORREF thumb_ink = enabled_on ? (hc ? c->active_ink : c->focus)
@@ -1392,8 +1422,7 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
             SetDCPenColor(dc, thumb_ink);
             int thumb = on ? x+wide-h+pad : x+pad;
             Ellipse(dc, thumb, y+pad, thumb+h-2*pad, y+h-pad);
-            r.left = x+wide+MulDiv(9, dpi, 96);
-            align = DT_LEFT;
+            // A separate visible label sits on the left. Keep the native name for AT.
         } else if (id == SETTINGS_FEEDBACK || id == SETTINGS_LABEL || id == SETTINGS_MUTED) {
             if (id == SETTINGS_FEEDBACK) ink = c->warning;
             if (id == SETTINGS_MUTED && !hc) ink = c->muted;
@@ -1405,7 +1434,7 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
         SetTextColor(dc, ink);
         wchar_t caption[192];
         int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
-        if (n) DrawTextW(dc, caption, n, &r, DT_NOPREFIX |
+        if (n && id != SETTINGS_SWITCH) DrawTextW(dc, caption, n, &r, DT_NOPREFIX |
             (id == SETTINGS_FEEDBACK ? DT_WORDBREAK : DT_SINGLELINE | DT_VCENTER | align | DT_END_ELLIPSIS));
         else if (r.bottom <= MulDiv(2, dpi, 96)) {
             SetDCBrushColor(dc, c->edge);
@@ -1487,12 +1516,15 @@ static BOOL CALLBACK style_settings_controls(HWND w, LPARAM unused) {
     int n = GetWindowTextW(w, label, ARRAYSIZE(label));
     UINT_PTR face = 0;
     if (!wcscmp(klass, L"Button")) {
-        if (!wcscmp(label, L"更改") || !wcscmp(label, L"重新录入") || !wcscmp(label, L"取消录入"))
+        if (!wcscmp(label, L"更改") || !wcscmp(label, L"重新录入") || !wcscmp(label, L"取消录入") ||
+            !wcscmp(label, L"重启更新") || !wcscmp(label, L"下载更新") ||
+            !wcscmp(label, L"重试下载"))
             face = SETTINGS_CHANGE;
         else if (!wcscmp(label, L"退出拾光")) face = SETTINGS_QUIT;
         else if (!wcscmp(label, L"最小化")) face = SETTINGS_MIN;
         else if (!wcscmp(label, L"关闭")) face = SETTINGS_CLOSE;
-        else if (!wcscmp(label, L"登录 Windows 时启动拾光")) face = SETTINGS_SWITCH;
+        else if (!wcscmp(label, L"登录 Windows 时启动拾光") ||
+                 !wcscmp(label, L"自动下载更新")) face = SETTINGS_SWITCH;
     } else if (!wcscmp(klass, L"Static")) {
         if (!wcscmp(label, L"拾光截图 / 设置")) {
             face = SETTINGS_TITLE;
@@ -1506,7 +1538,11 @@ static BOOL CALLBACK style_settings_controls(HWND w, LPARAM unused) {
                  !wcscmp(label, L"Win") || !wcscmp(label, L"Space") || !wcscmp(label, L"PgUp") ||
                  !wcscmp(label, L"PgDn") || !wcscmp(label, L"End") || !wcscmp(label, L"Home") ||
                  !wcscmp(label, L"Ins") || !wcscmp(label, L"Del")) face = SETTINGS_KEYCAP;
-        else if (!wcscmp(label, L"区域截图快捷键") || !wcscmp(label, L"+") ||
+        else if (!wcscmp(label, L"常规") || !wcscmp(label, L"软件更新") ||
+                 !wcscmp(label, L"区域截图快捷键") || !wcscmp(label, L"更新通道") ||
+                 !wcscmp(label, L"自动下载更新") || !wcscmp(label, L"登录 Windows 时启动拾光") ||
+                 !wcscmp(label, L"新版本已就绪") || !wcscmp(label, L"发现新版本") ||
+                 !wcscmp(label, L"+") ||
                  !wcsncmp(label, L"请按", 2)) face = SETTINGS_LABEL;
         else face = SETTINGS_MUTED;
     }
@@ -1605,6 +1641,7 @@ static void tray_menu(void) {
     AppendMenuW(menu, MF_STRING | has_image, CMD_SAVE, L"另存上次截图为 PNG…");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, CMD_SETTINGS, L"设置…");
+    if (update_available) AppendMenuW(menu, MF_STRING, CMD_UPDATE, L"重启更新");
     AppendMenuW(menu, MF_STRING, CMD_EXIT, L"退出");
     POINT p;
     int chosen = 0;
@@ -1630,6 +1667,13 @@ static LRESULT CALLBACK owner_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     switch (msg) {
+    case WM_TIMER:
+        if (wp == UPDATE_TIMER && settings) PostMessageW(settings, SG_UPDATE_MESSAGE, 0, 0);
+        return 0;
+    case WM_POWERBROADCAST:
+        if ((wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) && settings)
+            PostMessageW(settings, SG_UPDATE_MESSAGE, 0, 0);
+        return TRUE;
     case PREVIEW_WAKE:
         return 0; // Leaf's post-dispatch hook handles the latched failure.
     case WM_HOTKEY:
@@ -1661,7 +1705,7 @@ static LRESULT CALLBACK owner_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case COMMAND_MSG:
-        if (phase != IDLE || menu_open) return 0;
+        if (wp != CMD_UPDATE && (phase != IDLE || menu_open)) return 0;
         switch (wp) {
         case CMD_CAPTURE: start_capture(); break;
         case CMD_SETTINGS: show_settings(); break;
@@ -1681,6 +1725,10 @@ static LRESULT CALLBACK owner_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (FAILED(saved)) notice(L"无法保存 PNG，截图仍保留在内存中。");
                 idle();
             }
+            break;
+        case CMD_UPDATE:
+            if (update_available && settings && !PostMessageW(settings, SG_UPDATE_MESSAGE, 1, 0))
+                notice(L"暂时无法开始重启更新，请稍后再试。");
             break;
         case CMD_EXIT: PostQuitMessage(0); break;
         }
@@ -1703,8 +1751,8 @@ int sg_start(void) {
     INITCOMMONCONTROLSEX controls = {.dwSize = sizeof controls, .dwICC = ICC_WIN95_CLASSES};
     if (!InitCommonControlsEx(&controls)) return -1;
     if (!register_panel(instance)) return -1;
-    small_icon = shiguang_icon(GetSystemMetrics(SM_CXSMICON));
-    large_icon = shiguang_icon(GetSystemMetrics(SM_CXICON));
+    small_icon = load_app_icon(SM_CXSMICON);
+    large_icon = load_app_icon(SM_CXICON);
     if (!small_icon || !large_icon) return -1;
     taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSW controller = {.lpfnWndProc = owner_proc, .hInstance = instance, .lpszClassName = OWNER_CLASS};
@@ -1723,6 +1771,8 @@ int sg_start(void) {
 }
 
 void sg_ready(int background) {
+    SetTimer(owner, UPDATE_TIMER, 1000, NULL);
+    PostMessageW(settings, SG_UPDATE_MESSAGE, 0, 0);
     tray_ready = add_tray();
     PostMessageW(settings, SG_TRAY_MESSAGE, (WPARAM)tray_ready, 0);
     if (background) {
@@ -1732,6 +1782,15 @@ void sg_ready(int background) {
     if (!tray_ready) show_settings();
     else if (!active_hotkey) notice(L"截图快捷键已被占用。请在托盘设置里换一个，或从托盘截图。");
 }
+
+void sg_update_set_available(int available) { update_available = available != 0; }
+void sg_update_notice(const wchar_t *message) { notice(message); }
+int sg_settings_dark(void) {
+    return !ui_colors.high_contrast && ui_colors.surface == ui_normal_palette(true).surface;
+}
+int sg_update_can_restart(void) { return phase == IDLE && !menu_open && !recording_hook; }
+int sg_update_ui_ready(void) { return owner && settings && tray_ready; }
+void sg_update_exit(void) { PostQuitMessage(0); }
 
 void sg_stop(void) {
     sg_record_hotkey(0);

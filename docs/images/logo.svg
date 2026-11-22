@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">拾光 · 光点</title>
+  <desc id="desc">蓝色圆角底上的白色四角光芒与小光点，寓意拾起一点光，随手解决一件小事。</desc>
+  <defs>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#398ed0"/>
+      <stop offset="1" stop-color="#2265ac"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="29.333" fill="url(#blue)"/>
+  <path d="M60 22 C65 48 73 56 99 61 C73 66 65 74 60 100 C55 74 47 66 21 61 C47 56 55 48 60 22Z" fill="white"/>
+  <circle cx="100" cy="26" r="8" fill="white"/>
+</svg>

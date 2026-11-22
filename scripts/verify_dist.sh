@@ -9,6 +9,7 @@
 set -euo pipefail
 
 
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 dist=${1:?用法: verify_dist.sh <dist 目录>}
 zip_name=${ZIP_NAME:-shiguang-windows-x64.zip}
 mode=${MODE:-ref}
@@ -23,10 +24,16 @@ zip_sha=$(sha256sum "$zip_name" | awk '{print $1}')
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+if [ -n "${SG_FINAL_UPDATE_NOTE:-}" ]; then
+  : "${SG_FINAL_UPDATE_TAG:?需要最终分发的 tag}"
+  python3 "$here/update_release.py" verify "$zip_name" "$SG_FINAL_UPDATE_NOTE" "$SG_FINAL_UPDATE_TAG"
+elif [ "${SG_REQUIRE_UPDATE:-0}" = 1 ]; then
+  python3 "$here/update_release.py" inspect "$zip_name"
+fi
 unzip -q "$zip_name" -d "$work"
 manifest="$work/BUILD-MANIFEST.json"
 [ -f "$manifest" ] || { echo "::error::包内缺少 BUILD-MANIFEST.json"; exit 1; }
-jq -e . "$manifest" > /dev/null
+jq -e --arg repo "$GH_REPO" '.repo == $repo' "$manifest" > /dev/null
 
 commit=$(jq -r '.commit // empty' "$manifest")
 pkg_ref=$(jq -r '.ref // empty' "$manifest")
@@ -53,7 +60,10 @@ done < <(jq -r '.files[] | [.name, (.size | tostring), .sha256] | @tsv' "$manife
 
 # 包内不得有清单之外的文件
 listed=$(jq -r '.files[].name' "$manifest" | LC_ALL=C sort)
-present=$(cd "$work" && ls -A | grep -vx 'BUILD-MANIFEST.json' | LC_ALL=C sort)
+present=$(cd "$work" && ls -A | grep -Fxv 'BUILD-MANIFEST.json' | LC_ALL=C sort)
+if [ -n "${SG_FINAL_UPDATE_NOTE:-}" ]; then
+  present=$(printf '%s\n' "$present" | grep -Fxv -e UPDATE-INVENTORY.txt -e UPDATE-INVENTORY.sig)
+fi
 [ "$listed" = "$present" ] || { echo "::error::包内文件与清单不一致"; exit 1; }
 (cd "$work" && sha256sum -c SHA256SUMS.txt > /dev/null)
 
@@ -91,3 +101,4 @@ echo "zip_sha256=$zip_sha"
 echo "commit=$commit"
 echo "ref_object=$ref_object"
 echo "files=$count"
+echo "update_order=$(jq -r '.update_order // empty' "$manifest")"

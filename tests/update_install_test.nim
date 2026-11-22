@@ -2,23 +2,6 @@ import std/[os, strutils, tempfiles, unittest]
 import ../src/[update_install, update_package]
 import update_package_fixture
 
-when defined(windows) and defined(updatePinDiagnostics):
-  if paramCount() == 1 and paramStr(1) == "--diagnose-pin-roots":
-    # Test-only comparison, not a fallback for installation or normal tests.
-    for (label, base) in [("default-temp", getTempDir()), ("workspace", getCurrentDir())]:
-      try:
-        let root = createTempDir("sg-update-ci-pin-", "", base)
-        defer: removeDir(root)
-        let dir = root / "install"
-        createDir(dir)
-        echo "[pin-probe] ", label, " input=[", dir, "]"
-        let pin = pinUpdateDir(dir)
-        unpinUpdateDir(pin)
-        echo "[pin-probe] ", label, " accepted"
-      except CatchableError as e:
-        echo "[pin-probe] ", label, " rejected: ", e.msg
-    quit(0)
-
 const names = ["runtime.dll", "shiguang.exe"]
 let signed = verifyManifest(PublicKey, GoodManifest, GoodSignature)
 

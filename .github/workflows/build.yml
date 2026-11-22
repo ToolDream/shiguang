@@ -110,19 +110,22 @@ jobs:
       - name: 自动更新策略、验签、后台服务和安装事务
         shell: pwsh
         run: |
-          foreach ($case in 'policy', 'package', 'service', 'install', 'win_handshake') {
-            $pinDiagnostics = @()
-            if ($case -in 'install', 'win_handshake') {
-              $pinDiagnostics = @('-d:updatePinDiagnostics', '--passC:-DSG_UPDATE_PIN_DIAGNOSTICS')
+          $ErrorActionPreference = 'Stop'
+          # The runner's default TEMP can contain an 8.3 alias, which the updater rejects.
+          $leaf = 'sg-update-ci-' + [guid]::NewGuid().ToString('N')
+          $testTemp = Join-Path (Get-Location).ProviderPath $leaf
+          $testTemp = (New-Item -ItemType Directory -Path $testTemp).FullName
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
+          "自动更新测试临时目录：$testTemp"
+          try {
+            foreach ($case in 'policy', 'package', 'service', 'install', 'win_handshake') {
+              nim c -r "--nimcache:build/update-$case" "--out:build/update_${case}_test.exe" "tests/update_${case}_test.nim"
+              $code = $LASTEXITCODE
+              if ($code -ne 0) { throw "自动更新测试失败：$case（退出码 $code）" }
             }
-            nim c -r @pinDiagnostics "--nimcache:build/update-$case" "--out:build/update_${case}_test.exe" "tests/update_${case}_test.nim"
-            $code = $LASTEXITCODE
-            if ($code -ne 0) {
-              if ($case -eq 'install' -and (Test-Path -LiteralPath 'build/update_install_test.exe')) {
-                & ./build/update_install_test.exe --diagnose-pin-roots
-              }
-              throw "自动更新测试失败：$case（退出码 $code）"
-            }
+          } finally {
+            Remove-Item -LiteralPath $testTemp -Recurse -Force -ErrorAction Continue
           }
 
       - name: 核实自动更新构建身份

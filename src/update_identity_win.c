@@ -29,36 +29,11 @@ static int metadata(HANDLE h, BY_HANDLE_FILE_INFORMATION *info, int directory) {
     return 1;
 }
 
-#ifdef SG_UPDATE_PIN_DIAGNOSTICS
-#include <stdio.h>
-
-static void pin_diagnostic(const wchar_t *phase, const wchar_t *path,
-                           DWORD error, DWORD attributes, const wchar_t *resolved) {
-    static volatile LONG reported;
-    if (InterlockedIncrement(&reported) > 12) return;
-    fwprintf(stderr, L"[update-pin] phase=%ls error=%lu attributes=0x%08lx path=[%ls] resolved=[%ls]\n",
-             phase, (unsigned long)error, (unsigned long)attributes, path,
-             resolved ? resolved : L"");
-    fflush(stderr);
-}
-#define PIN_DIAG(phase, path, error, attributes, resolved) \
-    pin_diagnostic(phase, path, error, attributes, resolved)
-#else
-#define PIN_DIAG(phase, path, error, attributes, resolved) ((void)0)
-#endif
-
 static int is_dos_path(HANDLE h, const wchar_t *wanted) {
     wchar_t resolved[CAP + 4];
     DWORD n = GetFinalPathNameByHandleW(h, resolved, CAP + 4, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    if (!n || n >= CAP + 4) {
-        PIN_DIAG(L"final-path-query", wanted, n ? ERROR_INSUFFICIENT_BUFFER : GetLastError(), 0, NULL);
-        return 0;
-    }
-    if (n < 7 || wcsncmp(resolved, L"\\\\?\\", 4) != 0 || _wcsicmp(resolved + 4, wanted) != 0) {
-        PIN_DIAG(L"final-path-mismatch", wanted, 0, 0, resolved);
-        return 0;
-    }
-    return 1;
+    return n >= 7 && n < CAP + 4 && wcsncmp(resolved, L"\\\\?\\", 4) == 0 &&
+           _wcsicmp(resolved + 4, wanted) == 0;
 }
 
 void sg_update_unpin(void *p) {
@@ -70,10 +45,7 @@ void sg_update_unpin(void *p) {
 
 void *sg_update_pin(const wchar_t *input) {
     wchar_t path[CAP];
-    if (!full_path(input, path)) {
-        PIN_DIAG(L"non-local-or-invalid-input", input, 0, 0, NULL);
-        return NULL;
-    }
+    if (!full_path(input, path)) return NULL;
     Pins *pins = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *pins);
     if (!pins) return NULL;
     for (wchar_t *end = path + 3;; ++end) {
@@ -85,15 +57,8 @@ void *sg_update_pin(const wchar_t *input) {
         HANDLE h = CreateFileW(path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
-        BY_HANDLE_FILE_INFORMATION info = {0};
-        int valid = metadata(h, &info, 1);
-        if (!valid) {
-            PIN_DIAG(h == INVALID_HANDLE_VALUE ? L"open-directory" : L"metadata",
-                     path, GetLastError(), info.dwFileAttributes, NULL);
-        }
-        if (!valid || !is_dos_path(h, path) || pins->count == sizeof pins->handles / sizeof *pins->handles) {
-            if (valid && pins->count == sizeof pins->handles / sizeof *pins->handles)
-                PIN_DIAG(L"too-many-components", path, 0, 0, NULL);
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!metadata(h, &info, 1) || !is_dos_path(h, path) || pins->count == sizeof pins->handles / sizeof *pins->handles) {
             if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
             sg_update_unpin(pins);
             return NULL;

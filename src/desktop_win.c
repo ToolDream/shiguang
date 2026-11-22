@@ -1615,6 +1615,17 @@ int sg_bind_settings(HWND w) {
     if (!SetWindowLongPtrW(w, GWL_STYLE, border_style) && GetLastError()) return 0;
     if (!SetWindowPos(w, NULL, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
                       SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) return 0;
+
+    // Center the final frame before the first show; later shows retain placement.
+    MONITORINFO monitor = {.cbSize = sizeof monitor};
+    RECT outer;
+    if (!GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &monitor) ||
+        !GetWindowRect(w, &outer)) return 0;
+    RECT work = monitor.rcWork;
+    int x = work.left + (work.right - work.left - (outer.right - outer.left)) / 2;
+    int y = work.top + (work.bottom - work.top - (outer.bottom - outer.top)) / 2;
+    if (!SetWindowPos(w, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)) return 0;
+
     DWORD rounded = 2; // DWMWCP_ROUND; on older Windows this preference is ignored.
     DwmSetWindowAttribute(w, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &rounded, sizeof rounded);
     SendMessageW(w, WM_SETICON, ICON_SMALL, (LPARAM)small_icon);

@@ -183,11 +183,11 @@ static SHORT WINAPI test_key_state(int vk) {
 #undef canvas_open
 #undef GetKeyState
 
-static int glyph_pen_calls, glyph_blits, glyph_lines;
-static BOOL fail_glyph_line;
+static int glyph_pen_calls, glyph_blits, glyph_paths;
+static BOOL fail_glyph_path;
 static HPEN WINAPI test_glyph_pen(DWORD style, DWORD width, const LOGBRUSH *brush,
                                  DWORD entries, const DWORD *dashes) {
-    if (++glyph_pen_calls == 1 && !fail_glyph_line) return NULL;
+    if (++glyph_pen_calls == 1 && !fail_glyph_path) return NULL;
     return ExtCreatePen(style, width, brush, entries, dashes);
 }
 static BOOL WINAPI test_glyph_blit(HDC dst, int x, int y, int w, int h, HDC src,
@@ -195,17 +195,17 @@ static BOOL WINAPI test_glyph_blit(HDC dst, int x, int y, int w, int h, HDC src,
     ++glyph_blits;
     return StretchBlt(dst, x, y, w, h, src, sx, sy, sw, sh, rop);
 }
-static BOOL WINAPI test_glyph_line(HDC dc, const POINT *points, int count) {
-    if (++glyph_lines == 1 && fail_glyph_line) return FALSE;
-    return Polyline(dc, points, count);
+static BOOL WINAPI test_glyph_path(HDC dc, const POINT *points, const BYTE *ops, int count) {
+    if (++glyph_paths == 1 && fail_glyph_path) return FALSE;
+    return PolyDraw(dc, points, ops, count);
 }
-#define Polyline test_glyph_line
+#define PolyDraw test_glyph_path
 #define ExtCreatePen test_glyph_pen
 #define StretchBlt test_glyph_blit
 #include "../src/toolbar_glyph.h"
 #undef StretchBlt
 #undef ExtCreatePen
-#undef Polyline
+#undef PolyDraw
 
 static void save_test(void) {
     WCHAR folder[MAX_PATH], path[MAX_PATH];
@@ -624,8 +624,12 @@ static void release_into_editor(void) {
 static void toolbar_glyph_test(void) {
     const UiPalette saved = ui_colors;
     ui_colors = ui_palette(FALSE, FALSE);
-    // Drive the production draw dispatch for a diagonal glyph at 100% and 150%.
-    for (int side = 36; side <= 54; side += 18) {
+    HRSRC notice = FindResourceW(instance, MAKEINTRESOURCEW(102), RT_RCDATA);
+    assert(notice && SizeofResource(instance, notice) > 1000);
+    // Actual button widths after padding at 100%, 150%, and 200%.
+    const int button_sizes[] = {36, 58, 80};
+    for (int size = 0; size < (int)ARRAYSIZE(button_sizes); ++size) {
+        int side = button_sizes[size];
         HDC dc = CreateCompatibleDC(NULL);
         uint32_t *pixels;
         BITMAPINFO info = bitmap_info(side, side);
@@ -646,12 +650,50 @@ static void toolbar_glyph_test(void) {
             }
         assert(coverage > 30 && partial > 16);
 
+        int icon = side * 2 / 3, badge = side / 4;
+        int centered = (side - icon) / 2, left = (side - icon - badge) / 2;
+        Panel glyph_panel = toolbar;
+        for (int shape = 0; shape < SHAPES; ++shape) {
+            int main[80] = {0}, popup[80] = {0}, badge_pixels = 0;
+            glyph_panel.shape = (Tool)shape;
+            for (int menu = 0; menu <= 1; ++menu) {
+                int x0 = menu ? left : centered;
+                assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)));
+                aa_glyph(dc, item.rcItem, menu ? ACT_SHAPES : ACT_RECTANGLE + shape,
+                         &glyph_panel, RGB(0, 0, 0), RGB(255, 255, 255));
+                assert(GdiFlush());
+                for (int y = 0; y < side; ++y)
+                    for (int x = 0; x < side; ++x)
+                        if ((pixels[y * side + x] & 0xffffffu) != 0xffffffu) {
+                            if (x >= x0 && x < x0 + icon) ++(menu ? main : popup)[x - x0];
+                            else if (menu && x >= side - left - badge) ++badge_pixels;
+                            else assert(!"glyph paints outside its tile");
+                        }
+            }
+            assert(!memcmp(main, popup, sizeof main) && "shape menu and popup must draw the same glyph size");
+            assert(badge_pixels > 0 && "menu chevron must not overlap the shape");
+        }
+
+        glyph_panel.color = 1;
+        assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)));
+        aa_glyph(dc, item.rcItem, ACT_COLOR, &glyph_panel, RGB(0, 0, 0), RGB(255, 255, 255));
+        assert(GdiFlush());
+        int color_x = left + icon / 2;
+        assert(GetPixel(dc, color_x, side / 2) == palette[glyph_panel.color]);
+        BOOL outline = FALSE;
+        for (int y = centered + icon * 4 / 24; y <= centered + icon * 6 / 24; ++y) {
+            COLORREF pixel = GetPixel(dc, color_x, y);
+            if (GetRValue(pixel) < 64 && GetGValue(pixel) < 64 && GetBValue(pixel) < 64)
+                outline = TRUE;
+        }
+        assert(outline && "swatch must retain a visible outline");
+
         assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)) && GdiFlush());
         // Neither a failed allocation nor a failed primitive may blit the tile.
         DWORD objects = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
         for (int n = 0; n < 8; ++n) {
-            fail_glyph_line = n % 2;
-            glyph_pen_calls = glyph_blits = glyph_lines = 0;
+            fail_glyph_path = n % 2;
+            glyph_pen_calls = glyph_blits = glyph_paths = 0;
             aa_glyph(dc, item.rcItem, ACT_ARROW, &toolbar, RGB(0, 0, 0), RGB(255, 255, 255));
             assert(glyph_pen_calls == 2 && glyph_blits == 0);
         }
@@ -661,7 +703,7 @@ static void toolbar_glyph_test(void) {
             for (int x = side/2 - 1; x <= side/2 + 1; ++x)
                 if (!(pixels[y * side + x] & 0xffffffu)) ++direct;
         assert(direct > 0);
-        fail_glyph_line = FALSE;
+        fail_glyph_path = FALSE;
         SelectObject(dc, previous);
         DeleteObject(dib);
         DeleteDC(dc);
@@ -957,10 +999,14 @@ static void settings_caption_test(void) {
     const WNDCLASSW cls = {.lpfnWndProc = DefWindowProcW, .hInstance = instance,
                            .lpszClassName = L"Shiguang.Test.Settings"};
     assert(RegisterClassW(&cls));
+    MONITORINFO monitor = {.cbSize = sizeof monitor};
+    assert(GetMonitorInfoW(MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor));
+    RECT work = monitor.rcWork;
     HWND window = CreateWindowExW(0, cls.lpszClassName, APP_TITLE, WS_OVERLAPPEDWINDOW,
-        60, 60, 570, 350, NULL, NULL, instance, NULL);
-    RECT content, after;
+        work.left, work.top, 570, 350, NULL, NULL, instance, NULL);
+    RECT content, after, frame;
     assert(window && GetClientRect(window, &content) && sg_bind_settings(window));
+    assert(!IsWindowVisible(window));
     assert((HICON)SendMessageW(window, WM_GETICON, ICON_SMALL, 0) == small_icon);
     assert((HICON)SendMessageW(window, WM_GETICON, ICON_BIG, 0) == large_icon);
     assert(GetClientRect(window, &after) && EqualRect(&content, &after));
@@ -981,6 +1027,10 @@ static void settings_caption_test(void) {
     assert(title && min && close && toggle);
     show_settings();
     assert(settings_title == title && IsWindowVisible(window));
+    assert(GetWindowRect(window, &frame));
+    assert(abs((frame.left - work.left) - (work.right - frame.right)) <= 1 &&
+           abs((frame.top - work.top) - (work.bottom - frame.bottom)) <= 1 &&
+           "settings frame must open centered in the monitor work area");
     RECT header, min_rect;
     assert(GetWindowRect(title, &header) && GetWindowRect(min, &min_rect));
     assert(SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(header.left + 20, header.top + 20)) == HTCAPTION);
@@ -1022,18 +1072,27 @@ static void settings_caption_test(void) {
     assert(PeekMessageW(&message, window, SG_UPDATE_MESSAGE, SG_UPDATE_MESSAGE, PM_REMOVE));
     assert(message.wParam == 1);
     sg_update_set_available(0);
+
+    // Move the shown window as a user could, then exercise both ways of reopening it.
+    assert(SetWindowPos(window, NULL, frame.left - 24, frame.top - 24, 0, 0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE));
+    RECT moved;
+    assert(GetWindowRect(window, &moved) && !EqualRect(&frame, &moved));
     sg_settings_caption(0);
     assert(PeekMessageW(&message, window, WM_SYSCOMMAND, WM_SYSCOMMAND, PM_REMOVE));
     DispatchMessageW(&message);
     assert(IsIconic(window));
     show_settings();
     assert(!IsIconic(window) && IsWindowVisible(window));
+    assert(GetWindowRect(window, &after) && EqualRect(&moved, &after));
 
     tray_ready = TRUE;  // Use the real close handler without installing a tray icon.
     sg_settings_caption(1);
     assert(PeekMessageW(&message, window, WM_CLOSE, WM_CLOSE, PM_REMOVE));
     DispatchMessageW(&message);
     assert(IsWindow(window) && !IsWindowVisible(window));
+    show_settings();
+    assert(IsWindowVisible(window) && GetWindowRect(window, &after) && EqualRect(&moved, &after));
     tray_ready = FALSE;
     assert(DestroyWindow(window));
 }

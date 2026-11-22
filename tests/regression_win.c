@@ -184,10 +184,10 @@ static SHORT WINAPI test_key_state(int vk) {
 #undef GetKeyState
 
 static int glyph_pen_calls, glyph_blits, glyph_paths;
-static BOOL fail_glyph_path;
+static BOOL fail_glyph_pen, fail_glyph_path;
 static HPEN WINAPI test_glyph_pen(DWORD style, DWORD width, const LOGBRUSH *brush,
                                  DWORD entries, const DWORD *dashes) {
-    if (++glyph_pen_calls == 1 && !fail_glyph_path) return NULL;
+    if (++glyph_pen_calls == 1 && fail_glyph_pen) return NULL;
     return ExtCreatePen(style, width, brush, entries, dashes);
 }
 static BOOL WINAPI test_glyph_blit(HDC dst, int x, int y, int w, int h, HDC src,
@@ -659,8 +659,11 @@ static void toolbar_glyph_test(void) {
             for (int menu = 0; menu <= 1; ++menu) {
                 int x0 = menu ? left : centered;
                 assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)));
+                glyph_pen_calls = glyph_blits = glyph_paths = 0;
                 aa_glyph(dc, item.rcItem, menu ? ACT_SHAPES : ACT_RECTANGLE + shape,
                          &glyph_panel, RGB(0, 0, 0), RGB(255, 255, 255));
+                assert(glyph_pen_calls == 1 + menu && glyph_blits == 1 + menu &&
+                       "compare supersampled shape tiles, not the direct-draw fallback");
                 assert(GdiFlush());
                 for (int y = 0; y < side; ++y)
                     for (int x = 0; x < side; ++x)
@@ -693,6 +696,7 @@ static void toolbar_glyph_test(void) {
         DWORD objects = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
         for (int n = 0; n < 8; ++n) {
             fail_glyph_path = n % 2;
+            fail_glyph_pen = !fail_glyph_path;
             glyph_pen_calls = glyph_blits = glyph_paths = 0;
             aa_glyph(dc, item.rcItem, ACT_ARROW, &toolbar, RGB(0, 0, 0), RGB(255, 255, 255));
             assert(glyph_pen_calls == 2 && glyph_blits == 0);
@@ -703,7 +707,7 @@ static void toolbar_glyph_test(void) {
             for (int x = side/2 - 1; x <= side/2 + 1; ++x)
                 if (!(pixels[y * side + x] & 0xffffffu)) ++direct;
         assert(direct > 0);
-        fail_glyph_path = FALSE;
+        fail_glyph_pen = fail_glyph_path = FALSE;
         SelectObject(dc, previous);
         DeleteObject(dib);
         DeleteDC(dc);

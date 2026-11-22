@@ -35,6 +35,6 @@
 
 ## 下载与文档
 
-尚未发布：流水线还没在 GitHub 上运行，Actions 构件与 Releases 都还不存在。
+[下载 Windows x64 开发版](https://github.com/ToolDream/shiguang/releases)：选择最新的开发预发布，下载 `shiguang-windows-x64.zip`。
 
 [使用指南](docs/usage.md) · [环境与构建](docs/build.md) · [测试与验收](docs/testing.md) · [构建与发布流水线](docs/release.md) · [MIT 许可证](LICENSE)

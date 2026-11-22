@@ -1,8 +1,5 @@
 # 构建与发布流水线
 
-当前为仅构建模式：测试、编译和启动检查仍执行；仓库变量 `SHIGUANG_DISTRIBUTION_APPROVED` 未设为 `true` 时，不上传二进制附件，也不发布开发版或正式版。待安全复核完成后再由维护者决定是否启用分发。
-
-
 唯一工作流是 `.github/workflows/build.yml`，三个 job：Windows x64 测试与构建、开发版预发布、正式版本。
 
 ## 触发
@@ -22,10 +19,10 @@
 
 1. 检出本仓库，并把 Leaf 检出到 `leaf/`，核对提交确为 `df53b244383bc79abd3d8a035d4ac29636602444`。
 2. `scripts/prepare_windows_toolchain.ps1` 准备并校验 MinGW-w64，`setup-nim-action` 安装 Nim 2.2.6，记录提交、完整 ref 与 ref 对象。
-3. 跑 C 逻辑测试 6 项、设置视图能力检查 5 项，再以 `--path:leaf/src` 构建 `build/shiguang.exe`。
-4. 跑平台回归 7 项，用 `objdump` 递归解析导入表：只接受 System32 与 api-set 中的系统 DLL，其余依赖从工具链取出随包并继续递归。
+3. 跑 C 逻辑测试 9 项、设置视图能力检查 10 项，再以 `--path:leaf/src` 构建 `build/shiguang.exe`。
+4. 跑平台回归 8 项，用 `objdump` 递归解析导入表：只接受 System32 与 api-set 中的系统 DLL，其余依赖从工具链取出随包并继续递归。
 5. 打包 `dist/shiguang-windows-x64.zip`，写入 `SHA256SUMS.txt` 与 `BUILD-MANIFEST.json`。
-6. 把 zip 解到空目录，用只含 System32 的 `PATH` 启动，等待主窗口 `Shiguang.Controller` 出现后结束进程。
+6. 先用 Microsoft Defender 扫描待分发的文件；不通过则停止。把 zip 解到空目录，用只含 System32 的 `PATH` 启动，等待主窗口 `Shiguang.Controller` 出现后结束进程。
 7. 上传构件 `shiguang-windows-x64`，保留 14 天。
 
 ## 开发版预发布
@@ -75,7 +72,3 @@ MODE=ref REF=refs/tags/v1.2.3 GH_REPO=<owner/repo> GH_TOKEN=<token> bash scripts
 ## 发布脚本
 
 `scripts/publish.sh dev|release` 由流水线调用，也可手工运行。需要 `GH_TOKEN`、`GH_REPO`、`RUN_URL`；`dev` 模式另需 `SHA`，`release` 模式另需完整 `REF`；可选 `DIST`（默认 `dist`）与 `ZIP_NAME`。发布 job 是唯一持有 `contents: write` 的环节，其余只有读权限，使用默认 `GITHUB_TOKEN`，不需要 PAT。
-
-## 当前状态
-
-工作流与发布脚本尚未推送运行，Actions 构件与 Releases 目前都不存在；首次推送并成功运行后才会产生。

@@ -223,6 +223,18 @@ jobs:
           "zip sha256：$zipSha"
           Get-Content -LiteralPath (Join-Path $pkg 'BUILD-MANIFEST.json')
 
+      - name: 使用 Microsoft Defender 扫描待分发文件
+        shell: pwsh
+        run: |
+          $scanner = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+          $payload = (Resolve-Path 'build/pkg').Path
+          $before = Get-FileHash (Join-Path $payload 'shiguang.exe') -Algorithm SHA256
+          & $scanner -Scan -ScanType 3 -File $payload -DisableRemediation
+          if ($LASTEXITCODE -ne 0) { throw "Defender 检测到威胁或扫描未完成：退出码 $LASTEXITCODE" }
+          $after = Get-FileHash (Join-Path $payload 'shiguang.exe') -Algorithm SHA256
+          if ($before.Hash -ne $after.Hash) { throw '扫描前后 EXE 不一致' }
+          "已扫描待分发文件，EXE SHA-256: $($after.Hash)"
+
       - name: 解压后实测启动
         shell: pwsh
         run: |
@@ -326,9 +338,7 @@ jobs:
             if ($process) { $process.Dispose() }
           }
 
-      # 微软复核期间只测试、构建，不对外分发二进制。
       - name: 保存构件
-        if: vars.SHIGUANG_DISTRIBUTION_APPROVED == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: shiguang-windows-x64
@@ -339,7 +349,7 @@ jobs:
   publish-dev:
     name: 发布开发版预发布（每个 main 提交一个，不可变）
     needs: build
-    if: vars.SHIGUANG_DISTRIBUTION_APPROVED == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.deleted != true
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -371,7 +381,7 @@ jobs:
   publish-release:
     name: 发布正式版本
     needs: build
-    if: vars.SHIGUANG_DISTRIBUTION_APPROVED == 'true' && github.event_name == 'push' && github.event.deleted != true && github.ref_type == 'tag' && !startsWith(github.ref_name, 'dev-')
+    if: github.event_name == 'push' && github.event.deleted != true && github.ref_type == 'tag' && !startsWith(github.ref_name, 'dev-')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

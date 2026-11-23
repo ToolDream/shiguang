@@ -20,13 +20,13 @@ static const Glyph chevron_glyph = GLYPH(chevron_down);
 #undef GLYPH
 
 static BOOL draw_glyph(HDC dc, Glyph glyph, BOOL squash, BOOL fill, COLORREF swatch, COLORREF ink,
-                       float scale, int x, int y) {
+                       int weight, float scale, int x, int y) {
     int saved = SaveDC(dc);
     if (!saved) return FALSE;
     XFORM transform = {scale / GLYPH_GRID, 0, 0, scale / GLYPH_GRID, (float)x, (float)y};
     LOGBRUSH color = {BS_SOLID, ink, 0};
     HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
-                            2 * GLYPH_GRID, &color, 0, NULL);
+                            weight, &color, 0, NULL);
     BOOL ok = FALSE;
     if (!pen || !SetGraphicsMode(dc, GM_ADVANCED) || !SetWorldTransform(dc, &transform) ||
         !SelectObject(dc, pen)) goto done;
@@ -54,8 +54,9 @@ done:
     return ok;
 }
 
-static void aa_tile(HDC dc, int x, int y, int side, Glyph glyph, BOOL squash, BOOL fill,
-                    COLORREF swatch, COLORREF ink, COLORREF face) {
+static void aa_tile(HDC dc, Rect tile_rect, Glyph glyph, BOOL squash, BOOL fill,
+                    COLORREF swatch, COLORREF ink, COLORREF face, int weight) {
+    int x = tile_rect.left, y = tile_rect.top, side = tile_rect.right - x;
     int sample = side * 4;
     HDC tile = CreateCompatibleDC(dc);
     HBITMAP bitmap = tile ? CreateCompatibleBitmap(dc, sample, sample) : NULL;
@@ -64,23 +65,20 @@ static void aa_tile(HDC dc, int x, int y, int side, Glyph glyph, BOOL squash, BO
     if (old) {
         SetDCBrushColor(tile, face);
         if (FillRect(tile, &(RECT){0,0,sample,sample}, GetStockObject(DC_BRUSH)) &&
-            draw_glyph(tile, glyph, squash, fill, swatch, ink, (float)sample / 24, 0, 0) &&
+            draw_glyph(tile, glyph, squash, fill, swatch, ink, weight, (float)sample / 24, 0, 0) &&
             SetStretchBltMode(dc, HALFTONE) && SetBrushOrgEx(dc, 0, 0, NULL))
             drawn = StretchBlt(dc, x, y, side, side, tile, 0, 0, sample, sample, SRCCOPY);
         SelectObject(tile, old);
     }
     if (bitmap) DeleteObject(bitmap);
     if (tile) DeleteDC(tile);
-    if (!drawn) draw_glyph(dc, glyph, squash, fill, swatch, ink, (float)side / 24, x, y);
+    if (!drawn) draw_glyph(dc, glyph, squash, fill, swatch, ink, weight, (float)side / 24, x, y);
 }
 
-static void aa_glyph(HDC dc, RECT r, int action, const Panel *p, COLORREF ink, COLORREF face) {
-    int w = r.right - r.left, h = r.bottom - r.top;
-    int extent = w < h ? w : h;
-    int side = extent * 2 / 3;
-    if (side <= 0) return;
-
-    BOOL menu = action == ACT_SHAPES || action == ACT_COLOR;
+static void aa_glyph(HDC dc, RECT r, int dpi, int action, const Panel *p, COLORREF ink, COLORREF face) {
+    GlyphLayout layout = editor_glyph_layout((Rect){r.left, r.top, r.right, r.bottom}, dpi,
+                                            action == ACT_SHAPES || action == ACT_COLOR);
+    if (rect_empty(layout.icon)) return;
     int shape = action == ACT_SHAPES ? (int)p->shape : action - ACT_RECTANGLE;
     int index = action == ACT_COLOR ? p->color : action - ACT_RED;
     BOOL fill = (unsigned)index < COLORS;
@@ -88,12 +86,10 @@ static void aa_glyph(HDC dc, RECT r, int action, const Panel *p, COLORREF ink, C
                   (unsigned)action < BAR_BUTTONS ? action_glyphs[action] : (Glyph){0};
     if (!glyph.count) return;
 
-    int badge = menu ? extent / 4 : 0;
-    int x = r.left + (w - side - badge) / 2;
-    int y = r.top + (h - side) / 2;
-    aa_tile(dc, x, y, side, glyph, !fill && shape == ELLIPSE, fill, fill ? palette[index] : 0, ink, face);
-    if (badge)
-        aa_tile(dc, r.right - (w - side - badge) / 2 - badge, r.bottom - extent / 12 - badge,
-                badge, chevron_glyph, FALSE, FALSE, 0, ink, face);
+    // The 24-unit paths render at 20 DIP (10 for the chevron), yielding 1.6/1.25 DIP strokes.
+    aa_tile(dc, layout.icon, glyph, !fill && shape == ELLIPSE, fill, fill ? palette[index] : 0,
+            ink, face, 19 * GLYPH_GRID / 10);
+    if (!rect_empty(layout.badge))
+        aa_tile(dc, layout.badge, chevron_glyph, FALSE, FALSE, 0, ink, face, 3 * GLYPH_GRID);
 }
 #endif

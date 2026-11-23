@@ -25,22 +25,77 @@ static void history_test(void) {
 static void layout_test(void) {
     Rect screens[] = {{-800, -200, 0, 600}, {0, 0, 1024, 768}};
     Rect area = {-520, 80, -40, 300};
-    Dock d = editor_dock(area, screens[0], 40, 8, 9);
-    assert(d.bounds.left == -400 && d.bounds.right == -40 && d.bounds.top == 308);
+    Dock d = editor_dock(area, screens[0], 96, 8, 9);
+    assert(d.cell == 48 && d.cols == 9 && d.bounds.left == -472 &&
+           d.bounds.right == -40 && d.bounds.top == 308);
     Dock list = editor_popup(d, screens[0], 8, 5);
-    assert(list.bounds.left == -400 && list.bounds.top == 356 && list.cols == 5);
-    d = editor_dock((Rect){-520, 420, -40, 600}, screens[0], 40, 8, 9);
-    assert(d.bounds.top == 372 && d.bounds.bottom == 412);
-    d = editor_dock((Rect){5, 0, 1024, 768}, screens[1], 40, 8, 9);
-    assert(d.bounds.top == 720 && d.bounds.bottom == 760);
+    assert(list.bounds.left == -472 && list.bounds.top == 364 && list.cols == 5);
+    d = editor_dock((Rect){-520, 420, -40, 600}, screens[0], 96, 8, 9);
+    assert(d.bounds.top == 364 && d.bounds.bottom == 412);
+    d = editor_dock((Rect){5, 0, 1024, 768}, screens[1], 96, 8, 9);
+    assert(d.bounds.top == 712 && d.bounds.bottom == 760);
     list = editor_popup(d, screens[1], 8, 6);
-    assert(list.bounds.bottom == 712 && list.bounds.top == 672);
-    d = editor_dock((Rect){-90, -30, -5, 8}, (Rect){-100, -40, 0, 152}, 40, 8, 9);
+    assert(list.bounds.bottom == 704 && list.bounds.top == 656);
+    d = editor_dock(area, screens[0], 144, 12, 9);
+    assert(d.cell == 72 && d.cols == 9 && d.bounds.top == 312);
+    d = editor_dock((Rect){80, 50, 410, 90}, (Rect){0, 0, 410, 260}, 96, 8, 9);
+    assert(d.cell == 44 && d.cols == 9 && d.bounds.left == 14);
+    d = editor_dock((Rect){80, 10, 410, 40}, (Rect){0, 0, 600, 96}, 96, 8, 9);
+    assert(d.cell == 44 && d.cols == 9 && d.bounds.top == 48);
+    d = editor_dock((Rect){-90, -30, -5, 8}, (Rect){-100, -40, 0, 152}, 96, 8, 9);
     assert(d.cols == 2 && d.cell == 38 && d.bounds.top == -40);
     assert(d.bounds.right <= 0 && d.bounds.bottom <= 152);
     assert((9 + d.cols - 1) / d.cols * d.cell == d.bounds.bottom - d.bounds.top);
     assert(editor_screen((Rect){-700, -110, 200, -40}, screens, 2) == 0);
     assert(editor_screen((Rect){-700, -110, 200, 620}, screens, 2) == 1);
+
+    // At this anchor, 48 DIP has no vertical room for a popup even though two rows fit on screen.
+    const struct { int width, right, cell, popup_x; } popup_cases[] = {
+        {432, 432, 44, 36},  // Both new popups would overlap the bar.
+        {704, 432, 44, 36},  // The shape popup fits at the right, but the color popup does not.
+        {728, 432, 48, 440}, // Both popups can open to the right.
+        {728, 728, 48, 0},   // Both popups can open to the left (color starts at x=0).
+    };
+    for (size_t i = 0; i < sizeof popup_cases / sizeof *popup_cases; ++i) {
+        Rect screen = {0, 0, popup_cases[i].width, 112};
+        d = editor_dock((Rect){0, 0, popup_cases[i].right, 4}, screen, 96, 8, BAR_BUTTONS);
+        Dock shapes = editor_popup(d, screen, 8, SHAPES);
+        Dock colors = editor_popup(d, screen, 8, COLORS);
+        assert(rect_empty(intersect_rect(d.bounds, shapes.bounds)) && "shape popup covers the toolbar");
+        assert(rect_empty(intersect_rect(d.bounds, colors.bounds)) && "color popup covers the toolbar");
+        assert(d.cell == popup_cases[i].cell && colors.bounds.left == popup_cases[i].popup_x);
+    }
+    // Only the compact shape popup has room to the right; color already overlapped before.
+    Rect short_screen = {0, 0, 660, 104};
+    d = editor_dock((Rect){0, 0, 432, 4}, short_screen, 96, 8, BAR_BUTTONS);
+    list = editor_popup(d, short_screen, 8, SHAPES);
+    assert(rect_empty(intersect_rect(d.bounds, list.bounds)) && "compact shape popup can still open");
+    assert(d.cell == 44 && list.bounds.left == 440);
+
+    // Glyphs scale by DPI, not by the padded button, and only shrink to fit tight cells.
+    const struct { int w, h, dpi, icon, badge; } sizes[] = {
+        {36, 36, 96, 20, 10}, {40, 40, 96, 20, 10}, {64, 64, 144, 30, 15},
+        {88, 88, 192, 40, 20}, {22, 24, 96, 13, 6}, {2, 2, 96, 2, 0}
+    };
+    for (size_t i = 0; i < sizeof sizes / sizeof *sizes; ++i) {
+        int w = sizes[i].w, h = sizes[i].h, dpi = sizes[i].dpi;
+        Rect button = {0, 0, w, h};
+        GlyphLayout plain = editor_glyph_layout(button, dpi, 0);
+        GlyphLayout menu = editor_glyph_layout(button, dpi, 1);
+        assert(plain.icon.right - plain.icon.left == sizes[i].icon && rect_empty(plain.badge));
+        assert(menu.icon.right - menu.icon.left == sizes[i].icon);
+        assert(menu.icon.top == plain.icon.top && menu.icon.bottom == plain.icon.bottom);
+        assert(menu.icon.top >= 0 && menu.icon.bottom <= h);
+        assert(plain.icon.left == (w - sizes[i].icon) / 2 && menu.icon.left >= 0 && menu.icon.right <= w);
+        if (sizes[i].badge) {
+            assert(menu.badge.right - menu.badge.left == sizes[i].badge);
+            assert(menu.icon.right <= menu.badge.left && menu.badge.right <= w);
+            assert(menu.badge.top == (h - sizes[i].badge) / 2);
+        } else assert(rect_empty(menu.badge));
+    }
+    GlyphLayout offset = editor_glyph_layout((Rect){10, 20, 50, 60}, 96, 1);
+    assert(offset.icon.left == 14 && offset.icon.top == 30);
+    assert(offset.badge.left == 36 && offset.badge.top == 35);
 }
 
 static void selection_edges_test(void) {

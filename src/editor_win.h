@@ -25,7 +25,6 @@ enum Action {
     ACT_SHAPES, ACT_ARROW, ACT_PEN, ACT_TEXT, ACT_COLOR, ACT_UNDO, ACT_REDO, ACT_SAVE, ACT_COPY,
     ACT_RECTANGLE = 20, ACT_RED = 30
 };
-enum { BAR_BUTTONS = 9, SHAPES = 5, COLORS = 6 };
 extern const COLORREF palette[COLORS];
 
 typedef struct {

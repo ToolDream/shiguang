@@ -621,15 +621,30 @@ static void release_into_editor(void) {
     assert(base.width == 70 && base.height == 54 && canvas.image.bgra);
 }
 
+static void assert_antialiased_arrow(const uint32_t *pixels, int side, COLORREF face, COLORREF ink) {
+    assert(GdiFlush());
+    int coverage = 0, partial = 0;
+    for (int y = side / 6; y < side - side / 6; ++y)
+        for (int x = side / 6; x < side - side / 6; ++x) {
+            uint32_t px = pixels[y * side + x];
+            COLORREF color = RGB(px >> 16, px >> 8, px);
+            if (color != face) {
+                ++coverage;
+                if (color != ink) ++partial;
+            }
+        }
+    assert(coverage > 30 && partial > 16);
+}
+
 static void toolbar_glyph_test(void) {
     const UiPalette saved = ui_colors;
     ui_colors = ui_palette(FALSE, FALSE);
     HRSRC notice = FindResourceW(instance, MAKEINTRESOURCEW(102), RT_RCDATA);
     assert(notice && SizeofResource(instance, notice) > 1000);
     // Actual button widths after padding at 100%, 150%, and 200%.
-    const int button_sizes[] = {36, 58, 80};
+    const int button_sizes[] = {40, 64, 88};
     for (int size = 0; size < (int)ARRAYSIZE(button_sizes); ++size) {
-        int side = button_sizes[size];
+        int side = button_sizes[size], dpi = 96 + size * 48;
         HDC dc = CreateCompatibleDC(NULL);
         uint32_t *pixels;
         BITMAPINFO info = bitmap_info(side, side);
@@ -638,29 +653,29 @@ static void toolbar_glyph_test(void) {
         HGDIOBJ previous = SelectObject(dc, dib);
         DRAWITEMSTRUCT item = {.CtlType = ODT_BUTTON, .CtlID = ACT_ARROW + 1, .hDC = dc,
                                .rcItem = {0, 0, side, side}};
-        assert(SendMessageW(toolbar.window, WM_DRAWITEM, ACT_ARROW + 1, (LPARAM)&item));
-        assert(GdiFlush());
-        int coverage = 0, partial = 0;
-        for (int y = side/6; y < side-side/6; ++y)
-            for (int x = side/6; x < side-side/6; ++x) {
-                uint32_t px = pixels[y * side + x] & 0xffffffu;
-                COLORREF color = RGB(px >> 16, px >> 8, px);
-                if (color != ui_colors.surface) ++coverage;
-                if (color != ui_colors.surface && color != ui_colors.ink) ++partial;
-            }
-        assert(coverage > 30 && partial > 16);
+        // WM_DRAWITEM uses this HWND's real DPI; only the direct path can select a DPI explicitly.
+        if (size == 0) {
+            assert(SendMessageW(toolbar.window, WM_DRAWITEM, ACT_ARROW + 1, (LPARAM)&item));
+            assert_antialiased_arrow(pixels, side, ui_colors.surface, ui_colors.ink);
+        }
+        assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)));
+        glyph_pen_calls = glyph_blits = glyph_paths = 0;
+        aa_glyph(dc, item.rcItem, dpi, ACT_ARROW, &toolbar, RGB(0, 0, 0), RGB(255, 255, 255));
+        assert(glyph_pen_calls == 1 && glyph_blits == 1);
+        assert_antialiased_arrow(pixels, side, RGB(255, 255, 255), RGB(0, 0, 0));
 
-        int icon = side * 2 / 3, badge = side / 4;
-        int centered = (side - icon) / 2, left = (side - icon - badge) / 2;
+        Rect button = {0, 0, side, side};
+        GlyphLayout plain = editor_glyph_layout(button, dpi, 0);
+        GlyphLayout with_badge = editor_glyph_layout(button, dpi, 1);
         Panel glyph_panel = toolbar;
         for (int shape = 0; shape < SHAPES; ++shape) {
-            int main[80] = {0}, popup[80] = {0}, badge_pixels = 0;
+            int main[88] = {0}, popup[88] = {0}, badge_pixels = 0;
             glyph_panel.shape = (Tool)shape;
             for (int menu = 0; menu <= 1; ++menu) {
-                int x0 = menu ? left : centered;
+                Rect icon = menu ? with_badge.icon : plain.icon;
                 assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)));
                 glyph_pen_calls = glyph_blits = glyph_paths = 0;
-                aa_glyph(dc, item.rcItem, menu ? ACT_SHAPES : ACT_RECTANGLE + shape,
+                aa_glyph(dc, item.rcItem, dpi, menu ? ACT_SHAPES : ACT_RECTANGLE + shape,
                          &glyph_panel, RGB(0, 0, 0), RGB(255, 255, 255));
                 assert(glyph_pen_calls == 1 + menu && glyph_blits == 1 + menu &&
                        "compare supersampled shape tiles, not the direct-draw fallback");
@@ -668,8 +683,11 @@ static void toolbar_glyph_test(void) {
                 for (int y = 0; y < side; ++y)
                     for (int x = 0; x < side; ++x)
                         if ((pixels[y * side + x] & 0xffffffu) != 0xffffffu) {
-                            if (x >= x0 && x < x0 + icon) ++(menu ? main : popup)[x - x0];
-                            else if (menu && x >= side - left - badge) ++badge_pixels;
+                            if (x >= icon.left && x < icon.right && y >= icon.top && y < icon.bottom)
+                                ++(menu ? main : popup)[x - icon.left];
+                            else if (menu && x >= with_badge.badge.left && x < with_badge.badge.right &&
+                                     y >= with_badge.badge.top && y < with_badge.badge.bottom)
+                                ++badge_pixels;
                             else assert(!"glyph paints outside its tile");
                         }
             }
@@ -679,34 +697,39 @@ static void toolbar_glyph_test(void) {
 
         glyph_panel.color = 1;
         assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)));
-        aa_glyph(dc, item.rcItem, ACT_COLOR, &glyph_panel, RGB(0, 0, 0), RGB(255, 255, 255));
+        aa_glyph(dc, item.rcItem, dpi, ACT_COLOR, &glyph_panel, RGB(0, 0, 0), RGB(255, 255, 255));
         assert(GdiFlush());
-        int color_x = left + icon / 2;
+        int color_x = (with_badge.icon.left + with_badge.icon.right) / 2;
         assert(GetPixel(dc, color_x, side / 2) == palette[glyph_panel.color]);
+        int diameter = 0;
         BOOL outline = FALSE;
-        for (int y = centered + icon * 4 / 24; y <= centered + icon * 6 / 24; ++y) {
+        for (int y = 0; y < side; ++y) {
             COLORREF pixel = GetPixel(dc, color_x, y);
+            if (pixel != RGB(255, 255, 255)) ++diameter;
             if (GetRValue(pixel) < 64 && GetGValue(pixel) < 64 && GetBValue(pixel) < 64)
                 outline = TRUE;
         }
+        int expected = MulDiv(13, dpi, 96);
+        assert(diameter >= expected - 2 && diameter <= expected + 3);
         assert(outline && "swatch must retain a visible outline");
 
-        assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)) && GdiFlush());
         // Neither a failed allocation nor a failed primitive may blit the tile.
         DWORD objects = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
         for (int n = 0; n < 8; ++n) {
+            assert(FillRect(dc, &item.rcItem, GetStockObject(WHITE_BRUSH)));
             fail_glyph_path = n % 2;
             fail_glyph_pen = !fail_glyph_path;
             glyph_pen_calls = glyph_blits = glyph_paths = 0;
-            aa_glyph(dc, item.rcItem, ACT_ARROW, &toolbar, RGB(0, 0, 0), RGB(255, 255, 255));
+            aa_glyph(dc, item.rcItem, dpi, ACT_ARROW, &toolbar, RGB(0, 0, 0), RGB(255, 255, 255));
             assert(glyph_pen_calls == 2 && glyph_blits == 0);
+            assert(GdiFlush());
+            int direct = 0;
+            for (int y = side / 2 - 1; y <= side / 2 + 1; ++y)
+                for (int x = side / 2 - 1; x <= side / 2 + 1; ++x)
+                    if (!(pixels[y * side + x] & 0xffffffu)) ++direct;
+            assert(direct > 0);
         }
-        assert(GdiFlush() && GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) == objects);
-        int direct = 0;
-        for (int y = side/2 - 1; y <= side/2 + 1; ++y)
-            for (int x = side/2 - 1; x <= side/2 + 1; ++x)
-                if (!(pixels[y * side + x] & 0xffffffu)) ++direct;
-        assert(direct > 0);
+        assert(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) == objects);
         fail_glyph_pen = fail_glyph_path = FALSE;
         SelectObject(dc, previous);
         DeleteObject(dib);

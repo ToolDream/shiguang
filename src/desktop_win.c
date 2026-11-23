@@ -1016,7 +1016,7 @@ static BOOL place_toolbar(Rect area) {
     UINT dpi = GetDpiForWindow(surfaces[index].window);
     if (!dpi) dpi = 96;
     int gap = MulDiv(8, (int)dpi, 96);
-    Dock dock = editor_dock(area, screens[index], MulDiv(44, (int)dpi, 96), gap, BAR_BUTTONS);
+    Dock dock = editor_dock(area, screens[index], (int)dpi, gap, BAR_BUTTONS);
     if (!dock.cell) return FALSE;
     if (toolbar.window && (!same_rect(bar_dock.bounds, dock.bounds) ||
         bar_dock.cell != dock.cell || bar_dock.cols != dock.cols) && !move_panel(&toolbar, bar_dock, dock)) {

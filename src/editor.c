@@ -93,7 +93,9 @@ static Dock place(Dock d, Rect screen, int x, int y) {
     return d;
 }
 
-Dock editor_dock(Rect area, Rect screen, int cell, int gap, int buttons) {
+static int scale96(int px, int dpi) { return (px * dpi + 48) / 96; }
+
+static Dock dock_bar(Rect area, Rect screen, int cell, int gap, int buttons) {
     Dock d = dock_grid(screen, cell, buttons);
     int h = d.bounds.bottom;
     int y = area.bottom + gap;
@@ -114,6 +116,45 @@ Dock editor_popup(Dock bar, Rect screen, int gap, int buttons) {
     if (b.left - gap - w >= screen.left) return place(d, screen, b.left - gap - w, b.top);
     // In an exceptionally small viewport, this transient panel may overlap the bar.
     return place(d, screen, b.left, b.top - h);
+}
+
+static int popup_overlaps_bar(Dock bar, Rect screen, int gap, int buttons) {
+    Dock popup = editor_popup(bar, screen, gap, buttons);
+    return !rect_empty(intersect_rect(bar.bounds, popup.bounds));
+}
+
+Dock editor_dock(Rect area, Rect screen, int dpi, int gap, int buttons) {
+    int cell = scale96(48, dpi);
+    Dock compact = dock_bar(area, screen, scale96(44, dpi), gap, buttons);
+    if (screen.right - screen.left < buttons * cell || screen.bottom - screen.top < 2 * cell + gap)
+        return compact;
+
+    Dock full = dock_bar(area, screen, cell, gap, buttons);
+    // An anchor can leave neither vertical nor side room even when the screen fits two rows.
+    const int counts[] = {SHAPES, COLORS};
+    for (size_t i = 0; i < sizeof counts / sizeof *counts; ++i)
+        if (popup_overlaps_bar(full, screen, gap, counts[i]) &&
+            !popup_overlaps_bar(compact, screen, gap, counts[i])) return compact;
+    return full;
+}
+
+GlyphLayout editor_glyph_layout(Rect button, int dpi, int menu) {
+    int w = button.right - button.left, h = button.bottom - button.top;
+    int extent = min(w, h);
+    if (extent <= 0) return (GlyphLayout){0};
+    int room = extent - 2 * (extent / 16);
+    int badge = min(scale96(10, dpi), room / 3), gap = badge / 5;
+    // Reserve badge space even for plain buttons so a popup shape matches its toolbar glyph.
+    int side = min(scale96(20, dpi), room - badge - gap);
+    int x = button.left + (w - side - (menu ? badge + gap : 0)) / 2;
+    int y = button.top + (h - side) / 2;
+    GlyphLayout layout = {.icon = {x, y, x + side, y + side}};
+    if (menu && badge) {
+        x += side + gap;
+        y = button.top + (h - badge) / 2;
+        layout.badge = (Rect){x, y, x + badge, y + badge};
+    }
+    return layout;
 }
 
 int valid_hotkey(uint32_t chord) {

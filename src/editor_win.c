@@ -196,22 +196,38 @@ static void draw_icon(const DRAWITEMSTRUCT *item, const Panel *p) {
     SelectObject(dc, GetStockObject(DC_BRUSH));
     POINT cursor;
     BOOL hot = item->hwndItem && GetCursorPos(&cursor) && WindowFromPoint(cursor) == item->hwndItem;
-    BOOL active = selected || (item->itemState & ODS_SELECTED);
+    BOOL pressed = (item->itemState & ODS_SELECTED) != 0;
     BOOL disabled = (item->itemState & ODS_DISABLED) != 0;
-    active = active && !disabled;
+    BOOL active = !disabled && (selected || pressed);
     const UiPalette *c = &ui_colors;
     SetDCBrushColor(dc, c->surface);
     FillRect(dc, &r, GetStockObject(DC_BRUSH));
-    COLORREF face = active ? c->active : hot && !disabled && !c->high_contrast ? c->hover : c->surface;
-    SetDCPenColor(dc, face);
-    SetDCBrushColor(dc, face);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, 12, 12);
-    COLORREF ink = disabled ? c->muted : active ? c->active_ink : c->ink;
-    aa_glyph(dc, r, action, p, ink, face);
-    if (item->itemState & ODS_FOCUS) {
-        InflateRect(&r, -2, -2);
-        DrawFocusRect(dc, &r);
+
+    int dpi = (int)GetDpiForWindow(p->window);
+    if (!dpi) dpi = 96;
+    int w = r.right - r.left, h = r.bottom - r.top, extent = w < h ? w : h;
+    int inset = MulDiv(2, dpi, 96);
+    if (inset > extent / 16) inset = extent / 16;
+    RECT state = r;
+    InflateRect(&state, -inset, -inset);
+    int radius = MulDiv(12, dpi, 96);
+    if (radius > extent / 3) radius = extent / 3;
+    BOOL hover = hot && !disabled && !active;
+    COLORREF face = active ? (pressed ? c->pressed : c->active) :
+                    hover && !c->high_contrast ? c->hover : c->surface;
+    if (face != c->surface) {
+        SetDCPenColor(dc, face);
+        SetDCBrushColor(dc, face);
+        RoundRect(dc, state.left, state.top, state.right, state.bottom, radius, radius);
     }
+    COLORREF ink = disabled ? c->muted : active ? c->active_ink : c->ink;
+    aa_glyph(dc, r, dpi, action, p, ink, face);
+    if (hover && c->high_contrast) {
+        SelectObject(dc, GetStockObject(NULL_BRUSH));
+        SetDCPenColor(dc, c->ink);
+        RoundRect(dc, state.left, state.top, state.right, state.bottom, radius, radius);
+    }
+    if (item->itemState & ODS_FOCUS) DrawFocusRect(dc, &state);
     RestoreDC(dc, saved);
 }
 
@@ -261,15 +277,18 @@ static LRESULT CALLBACK panel_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             else RoundRect(dc, 0, 0, r.right, r.bottom, radius, radius);
             // Separate colors, history, and export without individual button borders.
             if (p && p->buttons[ACT_COPY] && GetDlgCtrlID(p->buttons[0]) == ACT_SHAPES + 1) {
+                SetDCPenColor(dc, ui_colors.high_contrast ? ui_colors.edge : ui_colors.hover);
                 for (int i = ACT_UNDO; i <= ACT_SAVE; i += ACT_SAVE - ACT_UNDO) {
                     RECT left, right;
                     if (!GetWindowRect(p->buttons[i-1], &left) || !GetWindowRect(p->buttons[i], &right) ||
                         left.top != right.top || right.left <= left.right + 2) continue;
                     POINT at = {(left.right + right.left) / 2, right.top};
                     if (!ScreenToClient(w, &at)) continue;
-                    int inset = MulDiv(5, dpi, 96);
-                    MoveToEx(dc, at.x, at.y+inset, NULL);
-                    LineTo(dc, at.x, at.y + right.bottom-right.top-inset);
+                    int height = right.bottom - right.top;
+                    int inset = (height - MulDiv(20, dpi, 96)) / 2;
+                    if (inset < 1) inset = height / 4;
+                    MoveToEx(dc, at.x, at.y + inset, NULL);
+                    LineTo(dc, at.x, at.y + height - inset);
                 }
             }
             EndPaint(w, &ps);
@@ -311,13 +330,16 @@ static BOOL place_panel_button(HWND w, Dock d, int index) {
 BOOL move_panel(Panel *p, Dock from, Dock to) {
     if (!p->window || to.cell <= 0 || to.cols <= 0) return FALSE;
     Rect b = to.bounds;
+    UINT dpi = GetDpiForWindow(p->window);
     if (!SetWindowPos(p->window, NULL, b.left, b.top, b.right-b.left, b.bottom-b.top,
                       SWP_NOACTIVATE | SWP_NOZORDER)) return FALSE;
-    if (from.cell == to.cell && from.cols == to.cols) return TRUE;
+    BOOL same_grid = from.cell == to.cell && from.cols == to.cols;
+    if (same_grid && dpi == GetDpiForWindow(p->window)) return TRUE;
     panel_corner(p->window, to);
-    for (int i = 0; i < BAR_BUTTONS && p->buttons[i]; ++i)
-        if (!place_panel_button(p->buttons[i], to, i)) return FALSE;
-    return InvalidateRect(p->window, NULL, FALSE);
+    if (!same_grid)
+        for (int i = 0; i < BAR_BUTTONS && p->buttons[i]; ++i)
+            if (!place_panel_button(p->buttons[i], to, i)) return FALSE;
+    return RedrawWindow(p->window, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
 BOOL open_panel(Panel *p, HINSTANCE instance, HWND owner, Dock d, int first, int count, void (*click)(int)) {

@@ -4,6 +4,7 @@
 #include <wchar.h>
 
 typedef enum { RECTANGLE, CIRCLE, ELLIPSE, TRIANGLE, DIAMOND, ARROW, PEN, TEXT } Tool;
+enum { BAR_BUTTONS = 9, SHAPES = 5, COLORS = 6 };
 typedef struct { int x, y; } EditPoint;
 typedef struct {
     Tool tool;
@@ -24,8 +25,10 @@ void history_clear(History *history);
 
 typedef struct { Rect bounds; int cols, cell; } Dock;
 size_t editor_screen(Rect area, const Rect *screens, size_t count);
-Dock editor_dock(Rect area, Rect screen, int cell, int gap, int buttons);
+Dock editor_dock(Rect area, Rect screen, int dpi, int gap, int buttons);
 Dock editor_popup(Dock bar, Rect screen, int gap, int buttons);
+typedef struct { Rect icon, badge; } GlyphLayout;
+GlyphLayout editor_glyph_layout(Rect button, int dpi, int menu);
 // Top, bottom, left, right stripes of the real selection, clipped to one surface.
 void selection_edges(Rect area, Rect clip, Rect edges[4]);
 enum { SEL_N = 1, SEL_E = 2, SEL_S = 4, SEL_W = 8, SEL_MOVE = 16 };

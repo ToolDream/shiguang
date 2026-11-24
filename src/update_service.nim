@@ -44,6 +44,9 @@ const
   Marker = "<!-- shiguang-update-v2 "
   BudgetMs = 30000
   ListingLimit = 2 * 1024 * 1024
+  # 单一分页常量：请求 URL、列表校验上限和截断判断必须始终一致。
+  # 生成的 URL 必须与 update_http_win.c 白名单里的字面量逐字相同。
+  ListingPage = 30
 
 proc checkedGet(fetch: UpdateFetch; url: string; limit: int; deadline: MonoTime): string =
   let remaining = (deadline - getMonoTime()).inMilliseconds
@@ -80,9 +83,13 @@ proc signedRelease(key: string; entry: JsonNode): Option[Release] =
       return none(Release)
 
 proc discover(input: WorkerInput; deadline: MonoTime): Option[Release] =
-  let listing = parseJson(checkedGet(input.fetch, Api & "?per_page=30", ListingLimit, deadline))
-  if listing.kind != JArray or listing.len > 30:
+  let listing = parseJson(checkedGet(input.fetch, Api & "?per_page=" & $ListingPage,
+    ListingLimit, deadline))
+  if listing.kind != JArray or listing.len > ListingPage:
     raise newException(IOError, "invalid GitHub release listing")
+  # GitHub returns the complete listing whenever it is shorter than the requested page,
+  # so extra queries there cannot add a candidate and must not be repeated.
+  let maybeTruncated = listing.len >= ListingPage
   var releases: seq[Release]
   var builds: seq[UpdateBuild]
   var hasStable, hasTest = false
@@ -93,14 +100,14 @@ proc discover(input: WorkerInput; deadline: MonoTime): Option[Release] =
       builds.add(release.get.manifest.build)
       hasStable = hasStable or release.get.manifest.build.channel == ucStable
       hasTest = hasTest or release.get.manifest.build.channel == ucTest
-  if not hasStable:
+  if maybeTruncated and not hasStable:
     let listing = checkedGet(input.fetch, Api & "/latest", ListingLimit, deadline)
     if listing != "":          # WinHTTP uses empty body for API 404 (no formal release).
       let release = signedRelease(input.key, parseJson(listing))
       if release.isSome:
         releases.add(release.get)
         builds.add(release.get.manifest.build)
-  if input.job.channel == ucTest and not hasTest:
+  if maybeTruncated and input.job.channel == ucTest and not hasTest:
     let item = checkedGet(input.fetch, Api & "/tags/" & DevTag, ListingLimit, deadline)
     if item != "":
       let release = signedRelease(input.key, parseJson(item))

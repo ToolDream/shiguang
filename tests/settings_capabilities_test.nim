@@ -38,32 +38,55 @@ proc requireSettingsGeometry(view: Node) =
       if b.handle == ids[key]: return b
     doAssert false, key
   for dpi in [96, 144]:
-    let change = pixelEdges(box("change").rect, dpi)
     let quit = pixelEdges(box("quit").rect, dpi)
-    doAssert change.right == (settingsWidth - 40) * dpi div 96 and
-      quit.right == (settingsWidth - 28) * dpi div 96
-    doAssert change.bottom - change.top == 40 * dpi div 96
+    let sidebarRight = (settingsSidebarWidth - 14) * dpi div 96
+    let cardRight = (settingsWidth - 40) * dpi div 96
+    doAssert quit.right == sidebarRight
+    doAssert quit.bottom - quit.top == 34 * dpi div 96
+    for key in ["nav-general", "nav-update"]:
+      let nav = pixelEdges(box(key).rect, dpi)
+      doAssert nav.right == sidebarRight, "sidebar nav right edge: " & key
+    if ids.hasKey("change"):
+      let change = pixelEdges(box("change").rect, dpi)
+      doAssert change.right == cardRight
+      doAssert change.bottom - change.top == 34 * dpi div 96
+      doAssert quit.bottom - quit.top == change.bottom - change.top
     for key in ["startup", "update-channel-trigger", "auto-download", "update-action", "update-progress"]:
       if ids.hasKey(key):
-        doAssert pixelEdges(box(key).rect, dpi).right == change.right, "right edge: " & key
-    doAssert pixelEdges(box("startup-label").rect, dpi).left <
-      pixelEdges(box("startup").rect, dpi).left
-    doAssert pixelEdges(box("auto-download-label").rect, dpi).left <
-      pixelEdges(box("auto-download").rect, dpi).left
-    doAssert quit.bottom - quit.top == change.bottom - change.top
-    for key in ["change", "quit", "startup", "startup-status", "update-channel-trigger",
-        "auto-download", "update-action", "update-progress", "update-feedback"]:
+        doAssert pixelEdges(box(key).rect, dpi).right == cardRight, "right edge: " & key
+    if ids.hasKey("startup-label") and ids.hasKey("startup"):
+      doAssert pixelEdges(box("startup-label").rect, dpi).left <
+        pixelEdges(box("startup").rect, dpi).left
+    if ids.hasKey("auto-download-label") and ids.hasKey("auto-download"):
+      doAssert pixelEdges(box("auto-download-label").rect, dpi).left <
+        pixelEdges(box("auto-download").rect, dpi).left
+    for key in ["nav-general", "nav-update", "tray", "quit", "change", "unregistered",
+        "startup", "startup-status", "general-tip",
+        "update-channel-trigger", "auto-download", "update-action", "update-progress",
+        "last-check", "update-feedback"]:
       if not ids.hasKey(key): continue
       let b = box(key)
       let pixels = pixelEdges(b.rect, dpi)
       let clip = pixelEdges(b.clip, dpi)
+      doAssert pixels.right > pixels.left and pixels.bottom > pixels.top, "empty control: " & key
       doAssert pixels.left >= clip.left and pixels.top >= clip.top and
         pixels.right <= clip.right and pixels.bottom <= clip.bottom, "clipped control: " & key
 
 let win32 = win32Capabilities(shadcnLight)
-let initialView = settingsView(0x0653'u32, false, "", true, nil, nil)
-doAssert find(initialView, "general") != nil, "settings must group general preferences"
-doAssert find(initialView, "software-update") != nil, "settings must group software updates"
+var selectedTab = stGeneral
+let initialView = settingsView(0x0653'u32, false, "", true, nil, nil,
+  activeTab = stGeneral, onSelectTab = proc(tab: SettingsTab) = selectedTab = tab)
+doAssert find(initialView, "general") != nil, "general tab must show general preferences"
+doAssert find(initialView, "nav-general") != nil and find(initialView, "nav-update") != nil,
+  "sidebar must expose both navigation tabs"
+find(initialView, "nav-update").handler(EventKind.click)(Event(kind: click))
+doAssert selectedTab == stUpdate
+let initialUpdateView = settingsView(0x0653'u32, false, "", true, nil, nil,
+  activeTab = stUpdate, onSelectTab = proc(tab: SettingsTab) = selectedTab = tab)
+doAssert find(initialUpdateView, "software-update") != nil, "update tab must show software updates"
+find(initialUpdateView, "nav-general").handler(EventKind.click)(Event(kind: click))
+doAssert selectedTab == stGeneral
+
 for (chord, recording, status, trayReady, expected, absent) in [
     (0x0653'u32, false, "", true, @["Ctrl", "Shift", "S", "更改"], @["未注册", "取消录入"]),
     (0x0f20'u32, false, "", true, @["Ctrl", "Alt", "Shift", "Win", "Space", "更改"], @["未注册"]),
@@ -72,13 +95,13 @@ for (chord, recording, status, trayReady, expected, absent) in [
     (0x0653'u32, false, shortcutFeedback(1, 0x0653), true,
       @["Ctrl", "Shift", "S", "ⓘ  新组合键已被占用，仍使用 Ctrl + Shift + S。", "重新录入"],
       @["取消录入", "更改"])]:
-  let view = settingsView(chord, recording, status, trayReady, nil, nil)
+  let view = settingsView(chord, recording, status, trayReady, nil, nil, activeTab = stGeneral)
   let minimize = find(view, "minimize")
   let close = find(view, "close")
   doAssert minimize != nil and close != nil, "independent accessible caption buttons"
   doAssert minimize.text == "最小化" and close.text == "关闭"
   doAssert minimize.styles == close.styles
-  doAssert find(view, "change").styles == find(view, "quit").styles
+  doAssert find(view, "nav-general").styles == find(view, "nav-update").styles
   requireSettingsGeometry(view)
   let tree = mount(view)
   discard checkCapabilities(tree, win32, compatible)
@@ -99,7 +122,7 @@ for (state, error, expected) in [
     (0.cint, true, "无法更新启动项。当前：未注册"),
     (1.cint, true, "无法更新启动项。当前：已注册，实际启动由 Windows 设置或策略决定")]:
   let view = settingsView(0x0653'u32, false, "", true, nil, nil,
-    startup = state, startupError = error)
+    startup = state, startupError = error, activeTab = stGeneral)
   requireSettingsGeometry(view)
   discard checkCapabilities(mount(view), win32, strict)
   let control = find(view, "startup")
@@ -124,12 +147,13 @@ block:
   var requested: seq[UpdateAction]
   var dropdown = false
   var feedback = ""
-  proc render(snapshot: UpdateSnapshot; allFeedback = false): Node =
+  proc render(snapshot: UpdateSnapshot; allFeedback = false; tab = stUpdate): Node =
     settingsView(0x0f20'u32, false, (if allFeedback: "录入失败，仍使用旧快捷键。" else: ""), true,
       nil, nil, startup = (if allFeedback: 2 else: 0), update =
       UpdateUi(snapshot: snapshot, feedback: feedback, channelOpen: dropdown,
         onAction: proc(action: UpdateAction) = requested.add(action),
-        onChannelOpen: proc(e: Event) = dropdown = e.open))
+        onChannelOpen: proc(e: Event) = dropdown = e.open),
+      activeTab = tab)
   proc activate(view: Node, key: string, event: Event) =
     let node = find(view, key)
     doAssert node != nil and node.handler(event.kind) != nil, key
@@ -141,6 +165,7 @@ block:
   var view = render(engine.snapshot)
   doAssert find(view, "installed-version").text == "当前版本 v9.8.7 正式版"
   doAssert find(view, "last-check").text == "最近检查：尚未检查"
+  doAssert find(view, "nav-update").text == "软件更新"
   doAssert selected(view) == "测试版" and enabled(view)
   activate(view, "update-channel", Event(kind: openChange, open: true))
   doAssert dropdown
@@ -151,6 +176,7 @@ block:
   doAssert engine.complete(job, some(candidate))
   view = render(engine.snapshot)
   doAssert not enabled(view) and find(view, "update-candidate").text.contains("dev-xyz")
+  doAssert find(view, "nav-update").text.contains("新版本")
   doAssert find(view, "last-check").text != "最近检查：尚未检查"
   activate(view, "update-action", Event(kind: click))
   doAssert requested[^1] == uaDownload
@@ -169,6 +195,7 @@ block:
     doAssert find(v, "update-status").text == label
     doAssert ("C:/private/internal-test-key" notin captions(v).join(" "))
     doAssert (find(v, "update-progress") != nil) == (phase == upDownloading)
+    doAssert find(v, "nav-update").text.contains("新版本") == (phase in {upAvailable, upReady})
     discard checkCapabilities(mount(v), win32, strict)
     requireSettingsGeometry(v)
     if action == "":
@@ -192,6 +219,7 @@ block:
   feedback = updateActionFeedback(uaStable, saved).message
   view = render(broken.snapshot, allFeedback = true)
   requireSettingsGeometry(view)
+  requireSettingsGeometry(render(broken.snapshot, allFeedback = true, tab = stGeneral))
   doAssert selected(view) == "测试版"
   doAssert find(view, "update-feedback").text.contains("无法保存")
   echo "Update settings state, callbacks and persistence failure passed"

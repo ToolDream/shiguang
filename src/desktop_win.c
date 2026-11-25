@@ -2,6 +2,7 @@
 #include "desktop_win.h"
 #include "export_win.h"
 #include "editor_win.h"
+#include "ui_draw_win.h"
 #include "shiguang_icon.h"
 #include <commctrl.h>
 #include <windowsx.h>
@@ -668,18 +669,53 @@ static BOOL draw_preview(HDC dc, const RECT *dirty, size_t i) {
     return draw_selection_edges(dc, b, area, selected);
 }
 
+static COLORREF blend_rgb(COLORREF bg, COLORREF fg, int alpha255) {
+    if (alpha255 <= 0) return bg;
+    if (alpha255 >= 255) return fg;
+    int inv = 255 - alpha255;
+    int r = (GetRValue(fg) * alpha255 + GetRValue(bg) * inv + 127) / 255;
+    int g = (GetGValue(fg) * alpha255 + GetGValue(bg) * inv + 127) / 255;
+    int b = (GetBValue(fg) * alpha255 + GetBValue(bg) * inv + 127) / 255;
+    return RGB(r, g, b);
+}
+
 static void paint_grips(HDC dc, Rect screen) {
     if (phase != EDITING || adjust_mode || !base.bgra) return;
     EditPoint grips[SELECTION_GRIPS];
     selection_grips(selection, desktop_bounds, grips);
+    COLORREF ring = ui_colors.high_contrast ? RGB(0, 0, 0) : ui_colors.accent;
+    COLORREF core = RGB(255, 255, 255);
     for (int i = 0; i < SELECTION_GRIPS; ++i) {
         Rect a = grip_rect(grips[i]);
         if (rect_empty(intersect_rect(a, screen))) continue;
-        RECT r = {a.left - screen.left, a.top - screen.top, a.right - screen.left, a.bottom - screen.top};
-        FillRect(dc, &r, GetStockObject(BLACK_BRUSH));
-        InflateRect(&r, -1, -1);
-        FillRect(dc, &r, GetStockObject(WHITE_BRUSH));
+        int cx = grips[i].x - screen.left, cy = grips[i].y - screen.top;
+        for (int dy = -GRIP_RADIUS; dy <= GRIP_RADIUS; ++dy) {
+            for (int dx = -GRIP_RADIUS; dx <= GRIP_RADIUS; ++dx) {
+                int px = cx + dx, py = cy + dy;
+                int d2 = dx * dx + dy * dy;
+                if (d2 > 18) continue;
+                COLORREF color;
+                if (d2 <= 4) {
+                    color = core;
+                } else if (d2 <= 6) {
+                    color = blend_rgb(core, ring, 140);
+                } else if (d2 <= 13) {
+                    color = ring;
+                } else {
+                    COLORREF under = GetPixel(dc, px, py);
+                    if (under == CLR_INVALID) continue;
+                    int alpha = d2 <= 16 ? 175 : 70;
+                    color = blend_rgb(under, ring, alpha);
+                }
+                SetPixelV(dc, px, py, color);
+            }
+        }
     }
+}
+
+static HFONT hint_ui_font(int height) {
+    return CreateFontW(-height, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                       0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
 }
 
 static BOOL paint_escape_hint(HDC dc, size_t i) {
@@ -694,11 +730,11 @@ static BOOL paint_escape_hint(HDC dc, size_t i) {
     SelectObject(dc, GetStockObject(DC_PEN));
     SetDCBrushColor(dc, ui_colors.hint);
     SetDCPenColor(dc, ui_colors.high_contrast ? ui_colors.ink : ui_colors.hint);
-    int radius = (box.bottom - box.top) / 3;
+    int radius = (box.bottom - box.top) / 2;
     BOOL ok = RoundRect(dc, box.left, box.top, box.right, box.bottom, radius, radius);
     HFONT *font = &surfaces[i].hint_font;
     // Overlay DPI changes cancel the capture; the hint height is fixed per surface.
-    if (!*font) *font = mark_font((box.bottom - box.top) / 2);
+    if (!*font) *font = hint_ui_font((box.bottom - box.top) * 13 / 24);
     if (*font) SelectObject(dc, *font);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, ui_colors.hint_ink);
@@ -1346,11 +1382,75 @@ static void start_capture(void) {
 }
 
 enum SettingsFace {
-    SETTINGS_CHANGE = 1, SETTINGS_QUIT, SETTINGS_MIN, SETTINGS_CLOSE, SETTINGS_TITLE,
-    SETTINGS_FEEDBACK, SETTINGS_SWITCH, SETTINGS_KEYCAP, SETTINGS_LABEL, SETTINGS_MUTED
+    SETTINGS_SECONDARY_BTN = 1, SETTINGS_ACCENT_BTN, SETTINGS_MIN, SETTINGS_CLOSE,
+    SETTINGS_NAV_ACTIVE, SETTINGS_NAV_IDLE, SETTINGS_SWITCH,
+    SETTINGS_TITLE, SETTINGS_BRAND, SETTINGS_PAGE_TITLE, SETTINGS_LABEL, SETTINGS_STATUS_READY,
+    SETTINGS_MUTED, SETTINGS_MUTED_RIGHT, SETTINGS_PLUS, SETTINGS_TRAY, SETTINGS_FEEDBACK,
+    SETTINGS_KEYCAP, SETTINGS_DIVIDER, SETTINGS_SIDEBAR, SETTINGS_CARD_BOX, SETTINGS_BANNER_BOX,
+    SETTINGS_WRAPPER
 };
-static HWND settings_title;
+enum SettingsBg { BG_SURFACE = 1, BG_SIDEBAR = 2, BG_CARD = 3, BG_BANNER = 4 };
+static HWND settings_title, settings_brand;
 static const WCHAR settings_face_key[] = L"Shiguang.SettingsFace";
+static const WCHAR settings_bg_key[] = L"Shiguang.SettingsBg";
+
+typedef struct {
+    int dpi;
+    HFONT brand, page_title, label, body, muted, keycap, badge;
+} SettingsFonts;
+static SettingsFonts settings_fonts;
+
+static void clear_settings_fonts(void) {
+    HFONT *list[] = {
+        &settings_fonts.brand, &settings_fonts.page_title, &settings_fonts.label,
+        &settings_fonts.body, &settings_fonts.muted, &settings_fonts.keycap, &settings_fonts.badge
+    };
+    for (size_t i = 0; i < ARRAYSIZE(list); ++i) {
+        if (*list[i]) DeleteObject(*list[i]);
+        *list[i] = NULL;
+    }
+    settings_fonts.dpi = 0;
+}
+
+static HFONT make_ui_font(int dip, int dpi, int weight) {
+    return CreateFontW(-MulDiv(dip, dpi, 96), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+}
+
+static void ensure_settings_fonts(int dpi) {
+    if (dpi <= 0) dpi = 96;
+    if (settings_fonts.dpi == dpi && settings_fonts.body) return;
+    clear_settings_fonts();
+    settings_fonts.dpi = dpi;
+    settings_fonts.brand = make_ui_font(15, dpi, FW_SEMIBOLD);
+    settings_fonts.page_title = make_ui_font(20, dpi, FW_SEMIBOLD);
+    settings_fonts.label = make_ui_font(14, dpi, FW_SEMIBOLD);
+    settings_fonts.body = make_ui_font(13, dpi, FW_NORMAL);
+    settings_fonts.muted = make_ui_font(12, dpi, FW_NORMAL);
+    settings_fonts.keycap = make_ui_font(13, dpi, FW_SEMIBOLD);
+    settings_fonts.badge = make_ui_font(11, dpi, FW_SEMIBOLD);
+}
+
+static COLORREF bg_color_for(uintptr_t kind, const UiPalette *c) {
+    switch (kind) {
+    case BG_SIDEBAR: return c->sidebar;
+    case BG_CARD: return c->card;
+    case BG_BANNER: return c->banner;
+    default: return c->surface;
+    }
+}
+
+static COLORREF settings_parent_bg(HWND w, const UiPalette *c) {
+    for (HWND cur = GetParent(w); cur && cur != settings; cur = GetParent(cur)) {
+        uintptr_t kind = (uintptr_t)GetPropW(cur, settings_bg_key);
+        if (kind) return bg_color_for(kind, c);
+    }
+    return c->surface;
+}
+
+static BOOL settings_is_button_face(DWORD_PTR face) {
+    return face >= SETTINGS_SECONDARY_BTN && face <= SETTINGS_SWITCH;
+}
 
 static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
     RECT r;
@@ -1360,88 +1460,237 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
     const UiPalette *c = &ui_colors;
     BOOL hc = c->high_contrast;
     int dpi = (int)GetDpiForWindow(w);
+    if (!dpi) dpi = 96;
+    ensure_settings_fonts(dpi);
+
+    if (id == SETTINGS_SIDEBAR) {
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SetDCBrushColor(dc, c->sidebar);
+        FillRect(dc, &r, GetStockObject(DC_BRUSH));
+        RECT border = {r.right - 1, r.top, r.right, r.bottom};
+        SetDCBrushColor(dc, hc ? c->edge : c->card_edge);
+        FillRect(dc, &border, GetStockObject(DC_BRUSH));
+        RestoreDC(dc, saved);
+        return;
+    }
+    if (id == SETTINGS_CARD_BOX || id == SETTINGS_BANNER_BOX) {
+        BOOL banner = id == SETTINGS_BANNER_BOX;
+        COLORREF fill = banner ? c->banner : c->card;
+        COLORREF border = banner ? c->banner_edge : c->card_edge;
+        ui_aa_round_rect(dc, r, MulDiv(12, dpi, 96), c->surface, fill, border, TRUE);
+        RestoreDC(dc, saved);
+        return;
+    }
+    if (id == SETTINGS_WRAPPER) {
+        uintptr_t own_bg = (uintptr_t)GetPropW(w, settings_bg_key);
+        COLORREF bg = own_bg ? bg_color_for(own_bg, c) : settings_parent_bg(w, c);
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SetDCBrushColor(dc, bg);
+        FillRect(dc, &r, GetStockObject(DC_BRUSH));
+        RestoreDC(dc, saved);
+        return;
+    }
+
+    COLORREF bg = settings_parent_bg(w, c);
     POINT p;
     BOOL hot = GetCursorPos(&p) && WindowFromPoint(p) == w;
-    BOOL pressed = (SendMessageW(w, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
+    BOOL pressed = settings_is_button_face(id) &&
+        (SendMessageW(w, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
     BOOL disabled = !IsWindowEnabled(w);
     COLORREF ink = disabled ? c->muted : c->ink;
+
     SelectObject(dc, GetStockObject(DC_BRUSH));
     SelectObject(dc, GetStockObject(DC_PEN));
-    SetDCBrushColor(dc, c->surface);
+    SetDCBrushColor(dc, bg);
     FillRect(dc, &r, GetStockObject(DC_BRUSH));
-    if (id == SETTINGS_CHANGE || id == SETTINGS_QUIT || id == SETTINGS_KEYCAP) {
-        BOOL primary = id == SETTINGS_CHANGE;
-        BOOL system_highlight = hc && !disabled && id != SETTINGS_KEYCAP && (hot || pressed);
-        UiFace face = primary ? ui_primary_face(c, pressed || system_highlight) :
-            (UiFace){system_highlight ? c->active :
-                         !hc && (id == SETTINGS_KEYCAP || (hot && id == SETTINGS_QUIT))
-                             ? c->hover : c->surface,
-                     system_highlight ? c->active_ink : ink};
-        if (disabled) face = (UiFace){c->surface, c->muted};
-        SetDCBrushColor(dc, face.fill);
-        SetDCPenColor(dc, primary && (hot || pressed) && !hc && !disabled ? c->focus : c->edge);
-        int radius = MulDiv(14, dpi, 96);
-        RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
-        ink = face.ink;
+
+    if (id == SETTINGS_DIVIDER) {
+        SetDCBrushColor(dc, hc ? c->edge : c->card_edge);
+        FillRect(dc, &r, GetStockObject(DC_BRUSH));
+        RestoreDC(dc, saved);
+        return;
     }
+
     if (id == SETTINGS_MIN || id == SETTINGS_CLOSE) {
+        COLORREF btn_bg = bg;
         if (hot || pressed) {
-            SetDCBrushColor(dc, hc ? c->active : id == SETTINGS_CLOSE ? RGB(192, 38, 49) : c->hover);
+            btn_bg = hc ? c->active : (id == SETTINGS_CLOSE ? RGB(220, 38, 38) : c->hover);
+            SetDCBrushColor(dc, btn_bg);
             FillRect(dc, &r, GetStockObject(DC_BRUSH));
             if (hc) ink = c->active_ink;
             else if (id == SETTINGS_CLOSE) ink = RGB(255, 255, 255);
+        } else if (!hc) {
+            ink = c->muted;
         }
-        SetDCPenColor(dc, ink);
-        int x = r.right / 2, y = r.bottom / 2, a = MulDiv(5, dpi, 96);
-        if (id == SETTINGS_MIN)
-            Polyline(dc, (POINT[]){{x - a, y}, {x + a + 1, y}}, 2);
-        else {
-            Polyline(dc, (POINT[]){{x-a,y-a},{x+a+1,y+a+1}}, 2);
-            Polyline(dc, (POINT[]){{x+a,y-a},{x-a-1,y+a+1}}, 2);
+        ui_aa_caption_glyph(dc, r, id == SETTINGS_CLOSE, btn_bg, ink, dpi);
+    } else if (id == SETTINGS_SWITCH) {
+        BOOL on = SendMessageW(w, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        ui_aa_switch(dc, r, bg, on, disabled, c, dpi);
+    } else if (id == SETTINGS_NAV_ACTIVE || id == SETTINGS_NAV_IDLE) {
+        BOOL active = id == SETTINGS_NAV_ACTIVE;
+        COLORREF fill = active ? (pressed ? c->pressed : c->active)
+            : (hot && !hc ? c->hover : bg);
+        if (hc && (active || hot || pressed)) {
+            fill = c->active;
+            ink = c->active_ink;
+        } else {
+            ink = active ? c->active_ink : (hot ? c->ink : c->muted);
         }
-    } else {
-        UINT align = DT_CENTER;
-        if (id == SETTINGS_TITLE) {
-            int inset = MulDiv(18, dpi, 96), side = MulDiv(21, dpi, 96);
-            DrawIconEx(dc, inset, (r.bottom-side)/2, small_icon, side, side, 0, NULL, DI_NORMAL);
-            r.left = inset + side + MulDiv(10, dpi, 96);
-            align = DT_LEFT;
-        } else if (id == SETTINGS_SWITCH) {
-            BOOL on = SendMessageW(w, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            int h = MulDiv(18, dpi, 96), wide = MulDiv(34, dpi, 96);
-            int x = r.right - wide - MulDiv(2, dpi, 96);
-            int y = (r.bottom-h)/2, pad = MulDiv(3, dpi, 96);
-            BOOL enabled_on = on && !disabled;
-            COLORREF track = enabled_on ? c->active : hc ? c->surface : c->hover;
-            COLORREF thumb_ink = enabled_on ? (hc ? c->active_ink : c->focus)
-                : disabled || !hc ? c->muted : c->ink;
-            SetDCBrushColor(dc, track);
-            SetDCPenColor(dc, disabled ? c->muted : enabled_on && !hc ? c->focus : c->edge);
-            RoundRect(dc, x, y, x+wide, y+h, h, h);
-            SetDCBrushColor(dc, thumb_ink);
-            SetDCPenColor(dc, thumb_ink);
-            int thumb = on ? x+wide-h+pad : x+pad;
-            Ellipse(dc, thumb, y+pad, thumb+h-2*pad, y+h-pad);
-            // A separate visible label sits on the left. Keep the native name for AT.
-        } else if (id == SETTINGS_FEEDBACK || id == SETTINGS_LABEL || id == SETTINGS_MUTED) {
-            if (id == SETTINGS_FEEDBACK) ink = c->warning;
-            if (id == SETTINGS_MUTED && !hc) ink = c->muted;
-            align = DT_LEFT;
-        }
-        HFONT font = (HFONT)SendMessageW(w, WM_GETFONT, 0, 0);
+        if (fill != bg || (hc && active))
+            ui_aa_round_rect(dc, r, MulDiv(8, dpi, 96), bg, fill,
+                             hc ? c->ink : fill, hc && active);
+        wchar_t caption[128] = {0};
+        GetWindowTextW(w, caption, ARRAYSIZE(caption));
+        BOOL is_updates = !wcsncmp(caption, L"软件更新", 4);
+        BOOL has_badge = is_updates && wcsstr(caption, L"新版本") != NULL;
+        int icon_side = MulDiv(16, dpi, 96);
+        int icon_x = MulDiv(12, dpi, 96);
+        int icon_y = (r.bottom - icon_side) / 2;
+        ui_aa_nav_icon(dc, icon_x, icon_y, icon_side, is_updates, fill, ink, dpi);
+        HFONT font = active ? settings_fonts.label : settings_fonts.body;
         if (font) SelectObject(dc, font);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, ink);
-        wchar_t caption[192];
+        RECT tr = r;
+        tr.left = icon_x + icon_side + MulDiv(8, dpi, 96);
+        tr.right -= MulDiv(8, dpi, 96);
+        if (has_badge) {
+            int bw = MulDiv(42, dpi, 96), bh = MulDiv(18, dpi, 96);
+            RECT br = {r.right - bw - MulDiv(8, dpi, 96), (r.bottom - bh) / 2,
+                       r.right - MulDiv(8, dpi, 96), (r.bottom + bh) / 2};
+            COLORREF bfill = hc ? c->surface : c->active;
+            COLORREF bink = hc ? c->ink : c->active_ink;
+            ui_aa_round_rect(dc, br, bh / 2, fill, bfill, hc ? c->ink : bfill, hc);
+            if (settings_fonts.badge) SelectObject(dc, settings_fonts.badge);
+            SetTextColor(dc, bink);
+            DrawTextW(dc, L"新版本", -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            if (font) SelectObject(dc, font);
+            SetTextColor(dc, ink);
+            tr.right = br.left - MulDiv(4, dpi, 96);
+        }
+        const WCHAR *short_label = is_updates ? L"软件更新" : caption;
+        DrawTextW(dc, short_label, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    } else if (id == SETTINGS_BRAND) {
+        int side = MulDiv(28, dpi, 96);
+        int ix = MulDiv(4, dpi, 96), iy = (r.bottom - side) / 2;
+        DrawIconEx(dc, ix, iy, large_icon ? large_icon : small_icon, side, side, 0, NULL, DI_NORMAL);
+        int tx = ix + side + MulDiv(10, dpi, 96);
+        SetBkMode(dc, TRANSPARENT);
+        RECT top_r = {tx, MulDiv(2, dpi, 96), r.right, r.bottom / 2 + MulDiv(2, dpi, 96)};
+        if (settings_fonts.brand) SelectObject(dc, settings_fonts.brand);
+        SetTextColor(dc, c->ink);
+        DrawTextW(dc, L"拾光截图", -1, &top_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RECT sub_r = {tx, r.bottom / 2 + MulDiv(1, dpi, 96), r.right, r.bottom - MulDiv(2, dpi, 96)};
+        if (settings_fonts.muted) SelectObject(dc, settings_fonts.muted);
+        SetTextColor(dc, hc ? c->ink : c->muted);
+        DrawTextW(dc, L"轻快截图标注", -1, &sub_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    } else if (id == SETTINGS_TITLE) {
+        // Standalone test window (without sidebar) keeps classic title paint;
+        // Option A dual-column layout shows branding in the sidebar and keeps this drag strip clean.
+        if (!settings_brand) {
+            int inset = MulDiv(18, dpi, 96), side = MulDiv(21, dpi, 96);
+            DrawIconEx(dc, inset, (r.bottom - side) / 2, small_icon, side, side, 0, NULL, DI_NORMAL);
+            RECT tr = r;
+            tr.left = inset + side + MulDiv(10, dpi, 96);
+            if (settings_fonts.label) SelectObject(dc, settings_fonts.label);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, c->ink);
+            wchar_t caption[128] = {0};
+            int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
+            if (n) DrawTextW(dc, caption, n, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    } else if (id == SETTINGS_SECONDARY_BTN || id == SETTINGS_ACCENT_BTN || id == SETTINGS_KEYCAP) {
+        BOOL accent = id == SETTINGS_ACCENT_BTN;
+        BOOL keycap = id == SETTINGS_KEYCAP;
+        UiFace face;
+        COLORREF border = c->edge;
+        if (disabled) {
+            face = (UiFace){c->surface, c->muted};
+            border = c->card_edge;
+        } else if (accent) {
+            face = ui_accent_face(c, pressed || (hc && hot));
+            border = hc ? c->ink : face.fill;
+        } else if (keycap) {
+            face = (UiFace){c->surface, c->ink};
+            border = c->edge;
+        } else {
+            BOOL sys_hl = hc && (hot || pressed);
+            face = (UiFace){
+                sys_hl ? c->active : (pressed ? c->pressed : (hot && !hc ? c->hover : c->surface)),
+                sys_hl ? c->active_ink : c->ink
+            };
+            border = (!hc && (hot || pressed)) ? c->focus : c->edge;
+        }
+        int rad = MulDiv(keycap ? 7 : 8, dpi, 96);
+        ui_aa_round_rect(dc, r, rad, bg, face.fill, border, !accent || hc);
+        HFONT font = keycap ? settings_fonts.keycap : (accent ? settings_fonts.label : settings_fonts.body);
+        if (font) SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, face.ink);
+        wchar_t caption[128] = {0};
         int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
-        if (n && id != SETTINGS_SWITCH) DrawTextW(dc, caption, n, &r, DT_NOPREFIX |
-            (id == SETTINGS_FEEDBACK ? DT_WORDBREAK : DT_SINGLELINE | DT_VCENTER | align | DT_END_ELLIPSIS));
-        else if (r.bottom <= MulDiv(2, dpi, 96)) {
-            SetDCBrushColor(dc, c->edge);
-            FillRect(dc, &r, GetStockObject(DC_BRUSH));
+        if (n) DrawTextW(dc, caption, n, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    } else {
+        wchar_t caption[192] = {0};
+        int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
+        const WCHAR *draw_text = caption;
+        int draw_len = n;
+        RECT tr = r;
+        UINT align = DT_LEFT;
+        HFONT font = settings_fonts.body;
+
+        if (id == SETTINGS_PAGE_TITLE) {
+            font = settings_fonts.page_title;
+            ink = c->ink;
+        } else if (id == SETTINGS_LABEL || id == SETTINGS_STATUS_READY) {
+            font = settings_fonts.label;
+            ink = c->ink;
+            if (id == SETTINGS_STATUS_READY) {
+                int dot = MulDiv(9, dpi, 96);
+                RECT dr = {r.left + MulDiv(1, dpi, 96), (r.bottom - dot) / 2,
+                           r.left + MulDiv(1, dpi, 96) + dot, (r.bottom + dot) / 2};
+                ui_aa_circle(dc, dr, bg, c->success, c->success, 0);
+                tr.left = dr.right + MulDiv(7, dpi, 96);
+            }
+        } else if (id == SETTINGS_TRAY) {
+            font = settings_fonts.muted;
+            ink = hc ? c->ink : c->muted;
+            BOOL ok_tray = wcsstr(caption, L"运行中") != NULL;
+            int dot = MulDiv(8, dpi, 96);
+            RECT dr = {r.left + MulDiv(2, dpi, 96), (r.bottom - dot) / 2,
+                       r.left + MulDiv(2, dpi, 96) + dot, (r.bottom + dot) / 2};
+            COLORREF dcolor = ok_tray ? c->success : c->warning;
+            ui_aa_circle(dc, dr, bg, dcolor, dcolor, 0);
+            tr.left = dr.right + MulDiv(7, dpi, 96);
+            if (draw_len > 0 && draw_text[0] == L'●') {
+                ++draw_text; --draw_len;
+                while (draw_len > 0 && draw_text[0] == L' ') { ++draw_text; --draw_len; }
+            }
+        } else if (id == SETTINGS_FEEDBACK) {
+            font = settings_fonts.muted;
+            ink = c->warning;
+        } else if (id == SETTINGS_MUTED || id == SETTINGS_MUTED_RIGHT) {
+            font = settings_fonts.muted;
+            ink = hc ? c->ink : c->muted;
+            if (id == SETTINGS_MUTED_RIGHT) align = DT_RIGHT;
+        } else if (id == SETTINGS_PLUS) {
+            font = settings_fonts.muted;
+            ink = hc ? c->ink : c->muted;
+            align = DT_CENTER;
+        }
+
+        if (font) SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, ink);
+        if (draw_len > 0) {
+            UINT flags = DT_NOPREFIX | (id == SETTINGS_FEEDBACK
+                ? DT_WORDBREAK : (DT_SINGLELINE | DT_VCENTER | align | DT_END_ELLIPSIS));
+            DrawTextW(dc, draw_text, draw_len, &tr, flags);
         }
     }
-    if (GetFocus() == w && !(SendMessageW(w, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
+
+    if (settings_is_button_face(id) && GetFocus() == w &&
+        !(SendMessageW(w, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
         GetClientRect(w, &r);
         InflateRect(&r, -2, -2);
         if (hc) DrawFocusRect(dc, &r);
@@ -1458,10 +1707,12 @@ static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
                                           UINT_PTR id, DWORD_PTR ref) {
     if (msg == WM_NCDESTROY) {
         if (ref == SETTINGS_TITLE) settings_title = NULL;
+        if (ref == SETTINGS_BRAND) settings_brand = NULL;
         RemovePropW(w, settings_face_key);
+        RemovePropW(w, settings_bg_key);
         RemoveWindowSubclass(w, settings_face_proc, id);
     }
-    if (ref == SETTINGS_TITLE && msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if ((ref == SETTINGS_TITLE || ref == SETTINGS_BRAND) && msg == WM_NCHITTEST) return HTTRANSPARENT;
     if (msg == WM_ERASEBKGND) return 1;
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps = {0};
@@ -1474,7 +1725,7 @@ static LRESULT CALLBACK settings_face_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
         paint_settings_face(w, (HDC)wp, ref);
         return 0;
     }
-    BOOL button = ref <= SETTINGS_CLOSE || ref == SETTINGS_SWITCH;
+    BOOL button = settings_is_button_face(ref);
     if (button && msg == WM_MOUSEMOVE) {
         TRACKMOUSEEVENT track = {.cbSize = sizeof track, .dwFlags = TME_LEAVE, .hwndTrack = w};
         TrackMouseEvent(&track);
@@ -1509,53 +1760,156 @@ static LRESULT CALLBACK settings_draw_proc(HWND w, UINT msg, WPARAM wp, LPARAM l
     return DefSubclassProc(w, msg, wp, lp);
 }
 
-static BOOL CALLBACK style_settings_controls(HWND w, LPARAM unused) {
-    (void)unused;
+typedef struct {
+    HWND sidebar;
+    HWND cards[6];
+    int card_count;
+    HWND banner_card;
+    BOOL update_tab_active;
+} SettingsLayoutScan;
+
+static HWND nth_ancestor_in_settings(HWND w, int steps) {
+    HWND cur = w;
+    for (int i = 0; i < steps && cur; ++i) cur = GetParent(cur);
+    return (cur && cur != settings && IsChild(settings, cur)) ? cur : NULL;
+}
+
+static void add_card_hwnd(SettingsLayoutScan *scan, HWND card) {
+    if (!card || scan->card_count >= (int)ARRAYSIZE(scan->cards)) return;
+    for (int i = 0; i < scan->card_count; ++i)
+        if (scan->cards[i] == card) return;
+    scan->cards[scan->card_count++] = card;
+}
+
+static BOOL CALLBACK scan_settings_layout(HWND w, LPARAM lp) {
+    SettingsLayoutScan *scan = (SettingsLayoutScan *)lp;
+    wchar_t klass[16], label[192] = {0};
+    if (!GetClassNameW(w, klass, ARRAYSIZE(klass))) return TRUE;
+    GetWindowTextW(w, label, ARRAYSIZE(label));
+    if (!wcscmp(klass, L"Button")) {
+        if (!wcscmp(label, L"退出拾光")) {
+            HWND p = nth_ancestor_in_settings(w, 1);
+            if (p) scan->sidebar = p;
+        }
+    } else if (!wcscmp(klass, L"Static")) {
+        if (!wcscmp(label, L"软件更新")) scan->update_tab_active = TRUE;
+        else if (!wcscmp(label, L"区域截图快捷键")) add_card_hwnd(scan, nth_ancestor_in_settings(w, 2));
+        else if (!wcscmp(label, L"登录 Windows 时启动拾光")) add_card_hwnd(scan, nth_ancestor_in_settings(w, 3));
+        else if (!wcscmp(label, L"更新通道")) add_card_hwnd(scan, nth_ancestor_in_settings(w, 2));
+        else if (!wcscmp(label, L"新版本已就绪") || !wcscmp(label, L"发现新版本")) {
+            HWND c = nth_ancestor_in_settings(w, 3);
+            if (c) scan->banner_card = c;
+        } else if (!wcscmp(label, L"暂无可用更新") || !wcscmp(label, L"等待自动检查") ||
+                   !wcscmp(label, L"正在检查更新") || !wcscmp(label, L"暂时无法检查更新") ||
+                   !wcscmp(label, L"正在下载更新") || !wcscmp(label, L"下载未成功") ||
+                   !wcscmp(label, L"正在准备重启")) {
+            add_card_hwnd(scan, nth_ancestor_in_settings(w, 3));
+        }
+    }
+    return TRUE;
+}
+
+static BOOL is_scanned_card(const SettingsLayoutScan *scan, HWND w) {
+    for (int i = 0; i < scan->card_count; ++i)
+        if (scan->cards[i] == w) return TRUE;
+    return FALSE;
+}
+
+static BOOL CALLBACK style_settings_controls(HWND w, LPARAM lp) {
+    const SettingsLayoutScan *scan = (const SettingsLayoutScan *)lp;
     wchar_t klass[16], label[192] = {0};
     if (!GetClassNameW(w, klass, ARRAYSIZE(klass))) return TRUE;
     int n = GetWindowTextW(w, label, ARRAYSIZE(label));
     UINT_PTR face = 0;
+
     if (!wcscmp(klass, L"Button")) {
-        if (!wcscmp(label, L"更改") || !wcscmp(label, L"重新录入") || !wcscmp(label, L"取消录入") ||
-            !wcscmp(label, L"重启更新") || !wcscmp(label, L"下载更新") ||
-            !wcscmp(label, L"重试下载"))
-            face = SETTINGS_CHANGE;
-        else if (!wcscmp(label, L"退出拾光")) face = SETTINGS_QUIT;
+        if (!wcscmp(label, L"常规"))
+            face = scan->update_tab_active ? SETTINGS_NAV_IDLE : SETTINGS_NAV_ACTIVE;
+        else if (!wcsncmp(label, L"软件更新", 4))
+            face = scan->update_tab_active ? SETTINGS_NAV_ACTIVE : SETTINGS_NAV_IDLE;
+        else if (!wcscmp(label, L"重启更新") || !wcscmp(label, L"下载更新") ||
+                 !wcscmp(label, L"重试下载"))
+            face = SETTINGS_ACCENT_BTN;
+        else if (!wcscmp(label, L"更改") || !wcscmp(label, L"重新录入") ||
+                 !wcscmp(label, L"取消录入") || !wcscmp(label, L"退出拾光"))
+            face = SETTINGS_SECONDARY_BTN;
         else if (!wcscmp(label, L"最小化")) face = SETTINGS_MIN;
         else if (!wcscmp(label, L"关闭")) face = SETTINGS_CLOSE;
         else if (!wcscmp(label, L"登录 Windows 时启动拾光") ||
                  !wcscmp(label, L"自动下载更新")) face = SETTINGS_SWITCH;
     } else if (!wcscmp(klass, L"Static")) {
-        if (!wcscmp(label, L"拾光截图 / 设置")) {
+        if (w == scan->sidebar) {
+            SetPropW(w, settings_bg_key, (HANDLE)(uintptr_t)BG_SIDEBAR);
+            face = SETTINGS_SIDEBAR;
+        } else if (w == scan->banner_card) {
+            SetPropW(w, settings_bg_key, (HANDLE)(uintptr_t)BG_BANNER);
+            face = SETTINGS_BANNER_BOX;
+        } else if (is_scanned_card(scan, w)) {
+            SetPropW(w, settings_bg_key, (HANDLE)(uintptr_t)BG_CARD);
+            face = SETTINGS_CARD_BOX;
+        } else if (GetWindow(w, GW_CHILD) != NULL) {
+            face = SETTINGS_WRAPPER;
+        } else if (n == 0) {
+            RECT r;
+            int dpi = (int)GetDpiForWindow(w);
+            if (!dpi) dpi = 96;
+            if (GetClientRect(w, &r) && r.bottom - r.top <= MulDiv(2, dpi, 96))
+                face = SETTINGS_DIVIDER;
+            else
+                face = SETTINGS_WRAPPER;
+        } else if (!wcscmp(label, L"拾光截图 / 设置")) {
             face = SETTINGS_TITLE;
             settings_title = w;
-        } else if (label[0] == L'ⓘ' || !wcsncmp(label, L"无法", 2) || !wcsncmp(label, L"已有", 2))
+        } else if (!wcscmp(label, L"拾光截图")) {
+            face = SETTINGS_BRAND;
+            settings_brand = w;
+        } else if (!wcscmp(label, L"常规") || !wcscmp(label, L"软件更新")) {
+            face = SETTINGS_PAGE_TITLE;
+        } else if (label[0] == L'●') {
+            face = SETTINGS_TRAY;
+        } else if (label[0] == L'ⓘ' || !wcsncmp(label, L"无法", 2) || !wcsncmp(label, L"已有", 2)) {
             face = SETTINGS_FEEDBACK;
-        else if ((n == 1 && ((label[0] >= L'A' && label[0] <= L'Z') ||
+        } else if ((n == 1 && ((label[0] >= L'A' && label[0] <= L'Z') ||
                   (label[0] >= L'0' && label[0] <= L'9') || wcschr(L"←↑→↓", label[0]))) ||
                  (n >= 2 && n <= 3 && label[0] == L'F' && label[1] >= L'1' && label[1] <= L'9') ||
                  !wcscmp(label, L"Ctrl") || !wcscmp(label, L"Alt") || !wcscmp(label, L"Shift") ||
                  !wcscmp(label, L"Win") || !wcscmp(label, L"Space") || !wcscmp(label, L"PgUp") ||
                  !wcscmp(label, L"PgDn") || !wcscmp(label, L"End") || !wcscmp(label, L"Home") ||
-                 !wcscmp(label, L"Ins") || !wcscmp(label, L"Del")) face = SETTINGS_KEYCAP;
-        else if (!wcscmp(label, L"常规") || !wcscmp(label, L"软件更新") ||
-                 !wcscmp(label, L"区域截图快捷键") || !wcscmp(label, L"更新通道") ||
-                 !wcscmp(label, L"自动下载更新") || !wcscmp(label, L"登录 Windows 时启动拾光") ||
-                 !wcscmp(label, L"新版本已就绪") || !wcscmp(label, L"发现新版本") ||
-                 !wcscmp(label, L"+") ||
-                 !wcsncmp(label, L"请按", 2)) face = SETTINGS_LABEL;
-        else face = SETTINGS_MUTED;
+                 !wcscmp(label, L"Ins") || !wcscmp(label, L"Del")) {
+            face = SETTINGS_KEYCAP;
+        } else if (!wcscmp(label, L"新版本已就绪")) {
+            face = SETTINGS_STATUS_READY;
+        } else if (!wcscmp(label, L"区域截图快捷键") || !wcscmp(label, L"更新通道") ||
+                   !wcscmp(label, L"自动下载更新") || !wcscmp(label, L"登录 Windows 时启动拾光") ||
+                   !wcscmp(label, L"发现新版本") || !wcscmp(label, L"暂无可用更新") ||
+                   !wcscmp(label, L"等待自动检查") || !wcscmp(label, L"正在检查更新") ||
+                   !wcscmp(label, L"暂时无法检查更新") || !wcscmp(label, L"正在下载更新") ||
+                   !wcscmp(label, L"下载未成功") || !wcscmp(label, L"正在准备重启") ||
+                   !wcsncmp(label, L"请按", 2)) {
+            face = SETTINGS_LABEL;
+        } else if (!wcsncmp(label, L"当前版本", 4)) {
+            face = SETTINGS_MUTED_RIGHT;
+        } else if (!wcscmp(label, L"+")) {
+            face = SETTINGS_PLUS;
+        } else {
+            face = SETTINGS_MUTED;
+        }
     }
     if (face && SetWindowSubclass(w, settings_face_proc, 1, face) &&
-        (face <= SETTINGS_CLOSE || face == SETTINGS_SWITCH) &&
-        SetPropW(w, settings_face_key, (HANDLE)face))
+        settings_is_button_face(face) && SetPropW(w, settings_face_key, (HANDLE)face))
         SetWindowSubclass(GetParent(w), settings_draw_proc, 1, 0);
     return TRUE;
 }
 
 void sg_style_settings(void) {
     if (settings) {
-        EnumChildWindows(settings, style_settings_controls, 0);
+        SettingsLayoutScan scan = {0};
+        EnumChildWindows(settings, scan_settings_layout, (LPARAM)&scan);
+        if (scan.sidebar) SetPropW(scan.sidebar, settings_bg_key, (HANDLE)(uintptr_t)BG_SIDEBAR);
+        if (scan.banner_card) SetPropW(scan.banner_card, settings_bg_key, (HANDLE)(uintptr_t)BG_BANNER);
+        for (int i = 0; i < scan.card_count; ++i)
+            SetPropW(scan.cards[i], settings_bg_key, (HANDLE)(uintptr_t)BG_CARD);
+        EnumChildWindows(settings, style_settings_controls, (LPARAM)&scan);
         RedrawWindow(settings, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     }
 }
@@ -1581,11 +1935,14 @@ static LRESULT CALLBACK settings_subclass(HWND w, UINT msg, WPARAM wp, LPARAM lp
         SetDCBrushColor(dc, old);
         return 1;
     }
-    if (msg == WM_NCHITTEST && settings_title && !IsIconic(w)) {
+    if (msg == WM_NCHITTEST && (settings_title || settings_brand) && !IsIconic(w)) {
         LRESULT hit = DefSubclassProc(w, msg, wp, lp);
         RECT caption;
-        if (hit == HTCLIENT && GetWindowRect(settings_title, &caption) &&
-            PtInRect(&caption, (POINT){GET_X_LPARAM(lp), GET_Y_LPARAM(lp)})) return HTCAPTION;
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (hit == HTCLIENT && settings_title && GetWindowRect(settings_title, &caption) &&
+            PtInRect(&caption, pt)) return HTCAPTION;
+        if (hit == HTCLIENT && settings_brand && GetWindowRect(settings_brand, &caption) &&
+            PtInRect(&caption, pt)) return HTCAPTION;
         return hit;
     }
     if (msg == WM_NCLBUTTONDBLCLK && wp == HTCAPTION) return 0;
@@ -1595,6 +1952,9 @@ static LRESULT CALLBACK settings_subclass(HWND w, UINT msg, WPARAM wp, LPARAM lp
     }
     if (msg == WM_NCDESTROY) {
         sg_record_hotkey(0);
+        clear_settings_fonts();
+        settings_title = NULL;
+        settings_brand = NULL;
         settings = NULL;
         RemoveWindowSubclass(w, settings_subclass, id);
     }
@@ -1806,6 +2166,7 @@ void sg_update_exit(void) { PostQuitMessage(0); }
 void sg_stop(void) {
     sg_record_hotkey(0);
     cancel_capture();
+    clear_settings_fonts();
     if (active_hotkey) UnregisterHotKey(owner, active_hotkey);
     if (tray_ready) {
         NOTIFYICONDATAW data = tray_data();

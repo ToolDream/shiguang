@@ -143,16 +143,23 @@ GlyphLayout editor_glyph_layout(Rect button, int dpi, int menu) {
     int extent = min(w, h);
     if (extent <= 0) return (GlyphLayout){0};
     int room = extent - 2 * (extent / 16);
-    int badge = min(scale96(10, dpi), room / 3), gap = badge / 5;
-    // Reserve badge space even for plain buttons so a popup shape matches its toolbar glyph.
-    int side = min(scale96(20, dpi), room - badge - gap);
-    int x = button.left + (w - side - (menu ? badge + gap : 0)) / 2;
+    int badge = min(scale96(6, dpi), room / 4);
+    int max_side = room - 2 * badge;
+    if (max_side <= 0) {
+        badge = 0;
+        max_side = room;
+    }
+    // Keep main icon centered and equal-sized across plain and menu buttons.
+    int side = min(scale96(20, dpi), max_side);
+    int x = button.left + (w - side) / 2;
     int y = button.top + (h - side) / 2;
     GlyphLayout layout = {.icon = {x, y, x + side, y + side}};
     if (menu && badge) {
-        x += side + gap;
-        y = button.top + (h - badge) / 2;
-        layout.badge = (Rect){x, y, x + badge, y + badge};
+        int gap = max(0, (button.right - (x + side) - badge) / 4);
+        int bx = min(button.right - badge, x + side + gap);
+        int by = min(button.bottom - badge, y + side - badge / 3);
+        if (bx < x + side) bx = x + side;
+        layout.badge = (Rect){bx, by, bx + badge, by + badge};
     }
     return layout;
 }

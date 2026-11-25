@@ -27,14 +27,14 @@ proc chordNames(chord: uint32): seq[string] =
 
 proc caps(chord: uint32): seq[Node] =
   if chord == 0:
-    return @[standard.cardDescription("未注册", key = "unregistered")]
+    return @[text("未注册", key = "unregistered", styles = style({"height": "20"}))]
   for i, name in chordNames(chord):
     if i > 0:
-      result.add(text("+", key = "plus-" & $i, styles = style({"width": "10"})))
+      result.add(text("+", key = "plus-" & $i, styles = style({"width": "8"})))
     # Win32 measures kbd from the complete text, including longer key names.
     let keycap = standard.kbd(name, key = "cap-" & $i)
     result.add(ui(NodeKind.tag, key = keycap.key, text = name,
-      styles = style({"height": "34"}), attributes = keycap.attributes))
+      styles = style({"height": "32"}), attributes = keycap.attributes))
 
 proc shortcutFeedback*(outcome: cint, active: uint32): string =
   let retained = if active == 0: "当前没有可用快捷键。"
@@ -47,6 +47,8 @@ proc shortcutFeedback*(outcome: cint, active: uint32): string =
   else: "当前无法更改，" & retained
 
 type
+  SettingsTab* = enum
+    stGeneral, stUpdate
   UpdateAction* = enum
     uaStable, uaTest, uaAutoOff, uaAutoOn, uaDownload, uaRestart
   UpdateFeedback* = object
@@ -102,14 +104,77 @@ proc lastCheckLabel(stamp: int64): string =
 
 const
   settingsTitle* = "拾光截图 / 设置"
-  settingsWidth* = 704
-  settingsHeight* = 678
+  settingsWidth* = 660
+  settingsHeight* = 480
+  settingsSidebarWidth* = 186
 
-proc settingsCard(key: string, children: seq[Node]): Node =
+proc settingsCard(key: string, children: seq[Node], gap = "10"): Node =
   ui(NodeKind.column, key = key, children = children, attributes = standard.card(@[]).attributes,
-    styles = style({"width": "full", "padding": "12", "gap": "6"}))
+    styles = style({"width": "full", "padding": "16", "gap": gap}))
 
-proc updateView(update: UpdateUi): seq[Node] =
+proc generalPage(chord: uint32, recording: bool, status: string,
+                 toggleRecording: Callback, startup: cint, startupError: bool,
+                 onStartup: Callback): seq[Node] =
+  let entry = if recording:
+    @[text("请按下新组合键  ·  Esc 取消", key = "recording")]
+  else: caps(chord)
+  let changeLabel = if recording: "取消录入" elif status.len != 0: "重新录入" else: "更改"
+  let startupStatus = case startup
+    of 0: "未注册"
+    of 1: "已注册，实际启动由 Windows 设置或策略决定"
+    of 2: "已有其他路径的同名启动项，未改动"
+    else: "无法读取启动项状态"
+  let startupFeedback =
+    if startupError or startup > 1:
+      @[text((if startupError: "无法更新启动项。当前：" else: "") & startupStatus,
+        key = "startup-status", styles = style({"width": "full", "height": "26"}))]
+    else: @[]
+  let shortcutFeedback =
+    if status.len > 0: @[text("ⓘ  " & status, key = "feedback",
+      styles = style({"width": "full", "height": "24"}))]
+    else: @[]
+  let shortcutCard = settingsCard("general-settings", @[
+    column(@[
+      text("区域截图快捷键", key = "heading", styles = style({"width": "full", "height": "22"})),
+      text("按下当前组合键，即可开始框选。", key = "description",
+        styles = style({"width": "full", "height": "18"}))
+    ], key = "shortcut-labels", styles = style({"width": "full", "gap": "2"})),
+    row(@[
+      row(entry, key = "caps", styles = style({"width": "full", "flex_grow": "1",
+        "gap": "4", "align": "center"})),
+      leaf.button(changeLabel, onClick = toggleRecording, key = "change",
+        styles = style({"width": "88", "height": "34"}))
+    ], key = "shortcut", styles = style({"width": "full", "height": "36", "gap": "10",
+      "justify": "between", "align": "center"}))
+  ] & shortcutFeedback, gap = "10")
+  let startupCard = settingsCard("startup-card", @[
+    row(@[
+      column(@[
+        text("登录 Windows 时启动拾光", key = "startup-label",
+          styles = style({"width": "full", "height": "22"})),
+        text("开机自动静默驻留托盘，不弹出设置窗口", key = "startup-description",
+          styles = style({"width": "full", "height": "18"}))
+      ], key = "startup-labels", styles = style({"width": "full", "flex_grow": "1", "gap": "2"})),
+      leaf.switch("登录 Windows 时启动拾光", checked = startup == 1, key = "startup",
+        disabled = startup > 1, onChange = onStartup,
+        styles = style({"width": "44", "height": "28"}))
+    ], key = "startup-row", styles = style({"width": "full", "height": "42", "gap": "12",
+      "justify": "between", "align": "center"}))
+  ] & startupFeedback, gap = "8")
+  @[
+    column(@[
+      text("常规", key = "general", styles = style({"width": "full", "height": "26"})),
+      text("快捷键与系统启动项设置，关闭本窗口后拾光仍在托盘待命。", key = "general-subtitle",
+        styles = style({"width": "full", "height": "18"}))
+    ], key = "general-header", styles = style({"width": "full", "gap": "4"})),
+    shortcutCard,
+    startupCard,
+    column(@[], key = "general-spacer", styles = style({"width": "full", "height": "full", "flex_grow": "1"})),
+    text("提示：在截图编辑中按 Enter 直接复制，Ctrl + S 另存为 PNG。", key = "general-tip",
+      styles = style({"width": "full", "height": "18"}))
+  ]
+
+proc updatePage(update: UpdateUi): seq[Node] =
   let snapshot = update.snapshot
   let restarting = snapshot.phase == upRestarting
   let (status, detail, actionLabel) = case snapshot.phase
@@ -128,31 +193,38 @@ proc updateView(update: UpdateUi): seq[Node] =
       (if detail.len == 0: "" else: "  ·  " & detail)
   let action = if snapshot.phase == upReady: uaRestart else: uaDownload
   var stateRow = @[column(@[
-    text(status, key = "update-status", styles = style({"height": "24"})),
-    text(detailText, key = "update-candidate", styles = style({"height": "20"}))
-  ], key = "update-state-labels", styles = style({"flex_grow": "1"}))]
+    text(status, key = "update-status", styles = style({"width": "full", "height": "22"})),
+    text(detailText, key = "update-candidate", styles = style({"width": "full", "height": "18"}))
+  ], key = "update-state-labels", styles = style({"width": "full", "flex_grow": "1", "gap": "2"}))]
   if actionLabel.len > 0:
     stateRow.add(leaf.button(actionLabel, onClick = proc(e: Event) = update.send(action),
-      key = "update-action", styles = style({"width": "116", "height": "40"})))
+      key = "update-action", styles = style({"width": "104", "height": "36"})))
   elif snapshot.phase == upDownloading:
     # The service currently reports only transfer phase, not downloaded bytes.
-    stateRow.add(ui(NodeKind.spinner, key = "update-progress", styles = style({"width": "116", "height": "8"})))
-  let rowStyle = style({"width": "full", "height": "46", "justify": "between", "align": "center"})
-  let switchStyle = style({"width": "40", "height": "32"})
+    stateRow.add(ui(NodeKind.spinner, key = "update-progress",
+      styles = style({"width": "104", "height": "10"})))
+  let rowStyle = style({"width": "full", "height": "42", "gap": "12",
+    "justify": "between", "align": "center"})
+  let switchStyle = style({"width": "44", "height": "28"})
   @[
     row(@[
       text("软件更新", key = "software-update", styles = style({"height": "26"})),
       text("当前版本 " & buildLabel(snapshot.installed), key = "installed-version",
-        styles = style({"height": "22"}))
-    ], key = "update-header", styles = style({"width": "full", "justify": "between", "align": "center"})),
+        styles = style({"height": "20"}))
+    ], key = "update-header", styles = style({"width": "full", "height": "28",
+      "justify": "between", "align": "center"})),
+    settingsCard("update-state-card", @[
+      row(stateRow, key = "update-state", styles = style({"width": "full", "height": "44",
+        "gap": "12", "justify": "between", "align": "center"}))
+    ], gap = "4"),
     settingsCard("update-settings", @[
       row(@[
-        text("更新通道", key = "channel-label"),
+        text("更新通道", key = "channel-label", styles = style({"height": "22"})),
         standard.select(standard.selectTrigger(disabled = restarting, key = "update-channel-trigger"),
           standard.selectContent(@[standard.selectItem("stable", "正式版"),
             standard.selectItem("test", "测试版")]),
           value = (if snapshot.settings.channel == ucTest: "test" else: "stable"),
-          open = update.channelOpen, key = "update-channel", label = "更新通道", width = 152,
+          open = update.channelOpen, key = "update-channel", label = "更新通道", width = 140,
           onOpenChange = update.onChannelOpen,
           onChange = proc(e: Event) =
             case e.value
@@ -161,22 +233,23 @@ proc updateView(update: UpdateUi): seq[Node] =
             of "test":
               if snapshot.settings.channel != ucTest: update.send(uaTest)
             else: discard)
-      ], key = "channel-row", styles = rowStyle),
+      ], key = "channel-row", styles = style({"width": "full", "height": "36",
+        "justify": "between", "align": "center"})),
       standard.separator(key = "channel-divider"),
       row(@[
         column(@[
-          text("自动下载更新", key = "auto-download-label", styles = style({"height": "24"})),
+          text("自动下载更新", key = "auto-download-label",
+            styles = style({"width": "full", "height": "22"})),
           text("每天检查一次，下载完成后由你决定何时重启", key = "auto-download-description",
-            styles = style({"height": "20"}))
-        ], key = "auto-download-labels"),
+            styles = style({"width": "full", "height": "18"}))
+        ], key = "auto-download-labels", styles = style({"width": "full", "flex_grow": "1", "gap": "2"})),
         leaf.switch("自动下载更新", checked = snapshot.settings.autoDownload, key = "auto-download",
           disabled = restarting, onChange = proc(e: Event) =
             update.send(if e.checked: uaAutoOn else: uaAutoOff), styles = switchStyle)
       ], key = "auto-download-row", styles = rowStyle)
-    ]),
-    settingsCard("update-state-card", @[row(stateRow, key = "update-state", styles = rowStyle)]),
+    ], gap = "12"),
     text("最近检查：" & lastCheckLabel(snapshot.settings.lastCheck), key = "last-check",
-      styles = style({"height": "20"}))
+      styles = style({"width": "full", "height": "18"}))
   ] & (if update.feedback.len == 0: @[] else: @[
     text("ⓘ  " & update.feedback, key = "update-feedback",
       styles = style({"width": "full", "height": "24"}))])
@@ -185,62 +258,44 @@ proc settingsView*(chord: uint32, recording: bool, status: string, trayReady: bo
                    toggleRecording, quit: Callback, minimize: Callback = nil,
                    close: Callback = nil, startup: cint = 0, startupError = false,
                    onStartup: Callback = nil,
-                   update = UpdateUi(snapshot: UpdateSnapshot(settings: defaultUpdateSettings()))): Node =
-  let entry = if recording:
-    @[text("请按下新组合键  ·  Esc 取消", key = "recording")]
-  else: caps(chord)
-  let changeLabel = if recording: "取消录入" elif status.len != 0: "重新录入" else: "更改"
-  let trayLabel = if trayReady: "●  托盘运行中 · 关闭窗口不影响截图"
+                   update = UpdateUi(snapshot: UpdateSnapshot(settings: defaultUpdateSettings())),
+                   activeTab: SettingsTab = stGeneral,
+                   onSelectTab: proc(tab: SettingsTab) = nil): Node =
+  let trayLabel = if trayReady: "●  托盘运行中"
     else: "●  通知区域图标不可用"
-  let startupStatus = case startup
-    of 0: "未注册"
-    of 1: "已注册，实际启动由 Windows 设置或策略决定"
-    of 2: "已有其他路径的同名启动项，未改动"
-    else: "无法读取启动项状态"
-  let startupFeedback =
-    if startupError or startup > 1:
-      @[text((if startupError: "无法更新启动项。当前：" else: "") & startupStatus,
-        key = "startup-status", styles = style({"width": "full", "height": "30"}))]
-    else: @[]
-  let actionRow = style({"width": "full", "height": "44", "gap": "14", "justify": "between", "align": "center"})
-  let contentButton = style({"width": "108", "height": "40"})
-  let captionButton = style({"width": "46", "height": "48"})
-  let shortcutFeedback =
-    if status.len > 0: @[text("ⓘ  " & status, key = "feedback",
-      styles = style({"width": "full", "height": "26"}))]
-    else: @[]
-  let generalCard = settingsCard("general-settings", @[
-      row(@[
-        column(@[
-          text("区域截图快捷键", key = "heading", styles = style({"height": "24"})),
-          text("按下当前组合键，即可开始框选。", key = "description", styles = style({"height": "20"}))
-        ], key = "shortcut-labels", styles = style({"flex_grow": "1"})),
-        row(entry, key = "caps", styles = style({"gap": "7", "align": "center"})),
-        leaf.button(changeLabel, onClick = toggleRecording, key = "change", styles = contentButton)
-      ], key = "shortcut", styles = actionRow)
-    ] & shortcutFeedback & @[
-      standard.separator(key = "startup-divider"),
-      row(@[
-        text("登录 Windows 时启动拾光", key = "startup-label"),
-        leaf.switch("登录 Windows 时启动拾光", checked = startup == 1, key = "startup",
-          disabled = startup > 1, onChange = onStartup, styles = style({"width": "40", "height": "32"}))
-      ], key = "startup-row", styles = actionRow)
-    ] & startupFeedback)
-  column(@[
+  let hasNewUpdate = update.snapshot.phase in {upAvailable, upReady}
+  let updateNavLabel = if hasNewUpdate: "软件更新  ·  新版本" else: "软件更新"
+  let navButtonStyle = style({"width": "full", "height": "36"})
+  let captionButton = style({"width": "44", "height": "40"})
+  let selectGeneral: Callback = proc(e: Event) =
+    if onSelectTab != nil: onSelectTab(stGeneral)
+  let selectUpdate: Callback = proc(e: Event) =
+    if onSelectTab != nil: onSelectTab(stUpdate)
+  let sidebar = column(@[
+    text("拾光截图", key = "brand-title", styles = style({"width": "full", "height": "44"})),
+    column(@[
+      leaf.button("常规", key = "nav-general", onClick = selectGeneral, styles = navButtonStyle),
+      leaf.button(updateNavLabel, key = "nav-update", onClick = selectUpdate, styles = navButtonStyle)
+    ], key = "sidebar-nav", styles = style({"width": "full", "gap": "4"})),
+    column(@[], key = "sidebar-spacer", styles = style({"width": "full", "height": "full", "flex_grow": "1"})),
+    standard.separator(key = "footer-divider"),
+    standard.cardDescription(trayLabel, key = "tray"),
+    leaf.button("退出拾光", key = "quit", onClick = quit,
+      styles = style({"width": "full", "height": "34"}))
+  ], key = "sidebar", styles = style({"width": $settingsSidebarWidth, "height": "full",
+    "padding": "14", "gap": "8"}))
+  let bodyChildren = case activeTab
+    of stGeneral:
+      generalPage(chord, recording, status, toggleRecording, startup, startupError, onStartup)
+    of stUpdate:
+      updatePage(update)
+  let mainPane = column(@[
     row(@[
-      text(settingsTitle, key = "caption", styles = style({"height": "48", "flex_grow": "1"})),
+      text(settingsTitle, key = "caption", styles = style({"width": "full", "height": "40", "flex_grow": "1"})),
       leaf.button("最小化", key = "minimize", onClick = minimize, styles = captionButton),
       leaf.button("关闭", key = "close", onClick = close, styles = captionButton)
-    ], key = "caption-row", styles = style({"width": "full", "height": "48", "align": "center"})),
-    standard.separator(key = "caption-divider"),
-    column(@[
-      text("常规", key = "general", styles = style({"height": "26"})),
-      generalCard
-    ] & updateView(update) & @[
-      standard.separator(key = "footer-divider"),
-      row(@[
-        standard.cardDescription(trayLabel, key = "tray"),
-        leaf.button("退出拾光", key = "quit", onClick = quit, styles = contentButton)
-      ], key = "footer", styles = actionRow)
-    ], key = "body", styles = style({"padding": "28", "gap": "7", "width": "full"}))
-  ], key = "settings", styles = style({"width": "full", "height": "full"}))
+    ], key = "caption-row", styles = style({"width": "full", "height": "40", "align": "center"})),
+    column(bodyChildren, key = "body", styles = style({"width": "full", "height": "full", "flex_grow": "1",
+      "padding": "24", "gap": "14"}))
+  ], key = "main-pane", styles = style({"width": "full", "flex_grow": "1", "height": "full"}))
+  row(@[sidebar, mainPane], key = "settings", styles = style({"width": "full", "height": "full"}))

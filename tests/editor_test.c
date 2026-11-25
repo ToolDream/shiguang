@@ -72,10 +72,10 @@ static void layout_test(void) {
     assert(rect_empty(intersect_rect(d.bounds, list.bounds)) && "compact shape popup can still open");
     assert(d.cell == 44 && list.bounds.left == 440);
 
-    // Glyphs scale by DPI, not by the padded button, and only shrink to fit tight cells.
+    // Glyphs scale by DPI, stay centered for both plain and menu buttons, and shrink only for tight cells.
     const struct { int w, h, dpi, icon, badge; } sizes[] = {
-        {36, 36, 96, 20, 10}, {40, 40, 96, 20, 10}, {64, 64, 144, 30, 15},
-        {88, 88, 192, 40, 20}, {22, 24, 96, 13, 6}, {2, 2, 96, 2, 0}
+        {36, 36, 96, 20, 6}, {40, 40, 96, 20, 6}, {64, 64, 144, 30, 9},
+        {88, 88, 192, 40, 12}, {22, 24, 96, 10, 5}, {2, 2, 96, 2, 0}
     };
     for (size_t i = 0; i < sizeof sizes / sizeof *sizes; ++i) {
         int w = sizes[i].w, h = sizes[i].h, dpi = sizes[i].dpi;
@@ -84,18 +84,20 @@ static void layout_test(void) {
         GlyphLayout menu = editor_glyph_layout(button, dpi, 1);
         assert(plain.icon.right - plain.icon.left == sizes[i].icon && rect_empty(plain.badge));
         assert(menu.icon.right - menu.icon.left == sizes[i].icon);
-        assert(menu.icon.top == plain.icon.top && menu.icon.bottom == plain.icon.bottom);
+        assert(menu.icon.left == plain.icon.left && menu.icon.top == plain.icon.top &&
+               menu.icon.bottom == plain.icon.bottom);
         assert(menu.icon.top >= 0 && menu.icon.bottom <= h);
         assert(plain.icon.left == (w - sizes[i].icon) / 2 && menu.icon.left >= 0 && menu.icon.right <= w);
         if (sizes[i].badge) {
             assert(menu.badge.right - menu.badge.left == sizes[i].badge);
+            assert(menu.badge.bottom - menu.badge.top == sizes[i].badge);
             assert(menu.icon.right <= menu.badge.left && menu.badge.right <= w);
-            assert(menu.badge.top == (h - sizes[i].badge) / 2);
+            assert(menu.badge.top >= 0 && menu.badge.bottom <= h);
         } else assert(rect_empty(menu.badge));
     }
     GlyphLayout offset = editor_glyph_layout((Rect){10, 20, 50, 60}, 96, 1);
-    assert(offset.icon.left == 14 && offset.icon.top == 30);
-    assert(offset.badge.left == 36 && offset.badge.top == 35);
+    assert(offset.icon.left == 20 && offset.icon.top == 30);
+    assert(offset.badge.left == 41 && offset.badge.top == 48);
 }
 
 static void selection_edges_test(void) {

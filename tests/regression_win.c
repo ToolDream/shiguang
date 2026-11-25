@@ -165,6 +165,15 @@ static SHORT WINAPI test_key_state(int vk) {
     return adjust_alt && vk == VK_MENU ? (SHORT)0x8000 : GetKeyState(vk);
 }
 
+static int glyph_pen_calls, glyph_blits, glyph_paths;
+static BOOL fail_glyph_pen, fail_glyph_path;
+static int WINAPI test_glyph_dib(HDC dst, int x, int y, DWORD w, DWORD h, int sx, int sy,
+                                 UINT start, UINT lines, const void *bits, const BITMAPINFO *info, UINT usage) {
+    ++glyph_blits;
+    return SetDIBitsToDevice(dst, x, y, w, h, sx, sy, start, lines, bits, info, usage);
+}
+
+#define SetDIBitsToDevice test_glyph_dib
 #define GetKeyState test_key_state
 #define canvas_open test_canvas_open
 #define AlphaBlend test_alpha_blend
@@ -183,17 +192,10 @@ static SHORT WINAPI test_key_state(int vk) {
 #undef canvas_open
 #undef GetKeyState
 
-static int glyph_pen_calls, glyph_blits, glyph_paths;
-static BOOL fail_glyph_pen, fail_glyph_path;
 static HPEN WINAPI test_glyph_pen(DWORD style, DWORD width, const LOGBRUSH *brush,
                                  DWORD entries, const DWORD *dashes) {
     if (++glyph_pen_calls == 1 && fail_glyph_pen) return NULL;
     return ExtCreatePen(style, width, brush, entries, dashes);
-}
-static BOOL WINAPI test_glyph_blit(HDC dst, int x, int y, int w, int h, HDC src,
-                                 int sx, int sy, int sw, int sh, DWORD rop) {
-    ++glyph_blits;
-    return StretchBlt(dst, x, y, w, h, src, sx, sy, sw, sh, rop);
 }
 static BOOL WINAPI test_glyph_path(HDC dc, const POINT *points, const BYTE *ops, int count) {
     if (++glyph_paths == 1 && fail_glyph_path) return FALSE;
@@ -201,11 +203,10 @@ static BOOL WINAPI test_glyph_path(HDC dc, const POINT *points, const BYTE *ops,
 }
 #define PolyDraw test_glyph_path
 #define ExtCreatePen test_glyph_pen
-#define StretchBlt test_glyph_blit
 #include "../src/toolbar_glyph.h"
-#undef StretchBlt
 #undef ExtCreatePen
 #undef PolyDraw
+#undef SetDIBitsToDevice
 
 static void save_test(void) {
     WCHAR folder[MAX_PATH], path[MAX_PATH];
@@ -570,7 +571,8 @@ static void verify_export_pixels(const Image *image) {
 static void theme_test(void) {
     const UiPalette light = ui_palette(FALSE, FALSE), dark = ui_palette(TRUE, FALSE);
     const UiPalette hc_light = ui_palette(FALSE, TRUE), hc_dark = ui_palette(TRUE, TRUE);
-    assert(light.surface == RGB(253, 251, 245) && dark.surface == RGB(37, 40, 36));
+    assert(light.surface == RGB(255, 255, 255) && dark.surface == RGB(28, 33, 43));
+    assert(light.sidebar != light.surface && dark.sidebar != dark.surface);
     assert(light.surface != dark.surface && light.ink != dark.ink);
     assert(light.accent == dark.accent && light.active != dark.active);
     assert(hc_light.surface == GetSysColor(COLOR_WINDOW) && hc_dark.surface == hc_light.surface);
@@ -579,6 +581,8 @@ static void theme_test(void) {
     UiFace hc_plain = ui_primary_face(&hc_dark, false), hc_pressed = ui_primary_face(&hc_dark, true);
     assert(hc_plain.fill == GetSysColor(COLOR_WINDOW) && hc_plain.ink == GetSysColor(COLOR_WINDOWTEXT));
     assert(hc_pressed.fill == GetSysColor(COLOR_HIGHLIGHT) && hc_pressed.ink == GetSysColor(COLOR_HIGHLIGHTTEXT));
+    UiFace acc = ui_accent_face(&light, false), acc_p = ui_accent_face(&light, true);
+    assert(acc.fill == light.accent && acc.ink == RGB(255, 255, 255) && acc_p.fill == light.accent_pressed);
     assert(palette[0] == RGB(233, 74, 68) && palette[1] == RGB(28, 113, 208));
 }
 
@@ -677,7 +681,7 @@ static void toolbar_glyph_test(void) {
                 glyph_pen_calls = glyph_blits = glyph_paths = 0;
                 aa_glyph(dc, item.rcItem, dpi, menu ? ACT_SHAPES : ACT_RECTANGLE + shape,
                          &glyph_panel, RGB(0, 0, 0), RGB(255, 255, 255));
-                assert(glyph_pen_calls == 1 + menu && glyph_blits == 1 + menu &&
+                assert(glyph_pen_calls == 1 && glyph_blits == 1 + menu &&
                        "compare supersampled shape tiles, not the direct-draw fallback");
                 assert(GdiFlush());
                 for (int y = 0; y < side; ++y)
@@ -692,7 +696,7 @@ static void toolbar_glyph_test(void) {
                         }
             }
             assert(!memcmp(main, popup, sizeof main) && "shape menu and popup must draw the same glyph size");
-            assert(badge_pixels > 0 && "menu chevron must not overlap the shape");
+            assert(badge_pixels > 0 && "menu caret must not overlap the shape");
         }
 
         glyph_panel.color = 1;
@@ -701,17 +705,21 @@ static void toolbar_glyph_test(void) {
         assert(GdiFlush());
         int color_x = (with_badge.icon.left + with_badge.icon.right) / 2;
         assert(GetPixel(dc, color_x, side / 2) == palette[glyph_panel.color]);
-        int diameter = 0;
-        BOOL outline = FALSE;
+        int first_y = side, last_y = -1;
+        BOOL halo = FALSE;
         for (int y = 0; y < side; ++y) {
             COLORREF pixel = GetPixel(dc, color_x, y);
-            if (pixel != RGB(255, 255, 255)) ++diameter;
-            if (GetRValue(pixel) < 64 && GetGValue(pixel) < 64 && GetBValue(pixel) < 64)
-                outline = TRUE;
+            if (pixel != RGB(255, 255, 255)) {
+                if (y < first_y) first_y = y;
+                if (y > last_y) last_y = y;
+                if (pixel != palette[glyph_panel.color] && GetBValue(pixel) > 160 && GetRValue(pixel) > 150)
+                    halo = TRUE;
+            }
         }
-        int expected = MulDiv(13, dpi, 96);
+        int diameter = first_y <= last_y ? last_y - first_y + 1 : 0;
+        int expected = MulDiv(17, dpi, 96);
         assert(diameter >= expected - 2 && diameter <= expected + 3);
-        assert(outline && "swatch must retain a visible outline");
+        assert(halo && "swatch must retain a subtle outer halo ring");
 
         // Neither a failed allocation nor a failed primitive may blit the tile.
         DWORD objects = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
@@ -894,7 +902,7 @@ static void edit_test(void) {
     assert_shaded(outside, original);
     paint_grips(probe, screen);
     assert(GetPixel(probe, x, y) == RGB(255, 255, 255));
-    assert(GetPixel(probe, x + GRIP_RADIUS, y + GRIP_RADIUS) == RGB(0, 0, 0));
+    assert(GetPixel(probe, x + 3, y) == ui_colors.accent);
     assert(!memcmp(canvas.image.bgra, base.bgra, image_bytes(base.width, base.height)));
     SelectObject(probe, prev);
     DeleteObject(dib);
@@ -1082,8 +1090,8 @@ static void settings_caption_test(void) {
     assert(dib);
     HGDIOBJ previous = SelectObject(probe, dib);
     SendMessageW(toggle, WM_PRINTCLIENT, (WPARAM)probe, PRF_CLIENT);
-    COLORREF track = GetPixel(probe, bounds.right - MulDiv(19, dpi, 96), bounds.bottom / 2);
-    assert(track == ui_colors.active);
+    COLORREF track = GetPixel(probe, bounds.right - MulDiv(28, dpi, 96), bounds.bottom / 2);
+    assert(track == ui_colors.accent);
     SelectObject(probe, previous);
     DeleteObject(dib);
     DeleteDC(probe);

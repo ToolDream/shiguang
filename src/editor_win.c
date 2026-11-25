@@ -15,13 +15,27 @@ UiPalette ui_colors;
 
 UiPalette ui_palette(BOOL dark, BOOL high_contrast) {
     if (high_contrast) return (UiPalette){
-        .surface = GetSysColor(COLOR_WINDOW), .ink = GetSysColor(COLOR_WINDOWTEXT),
-        .muted = GetSysColor(COLOR_GRAYTEXT), .edge = GetSysColor(COLOR_WINDOWTEXT),
-        .hover = GetSysColor(COLOR_HOTLIGHT), .active = GetSysColor(COLOR_HIGHLIGHT),
-        .active_ink = GetSysColor(COLOR_HIGHLIGHTTEXT), .pressed = GetSysColor(COLOR_HIGHLIGHT),
+        .surface = GetSysColor(COLOR_WINDOW),
+        .sidebar = GetSysColor(COLOR_WINDOW),
+        .card = GetSysColor(COLOR_WINDOW),
+        .card_edge = GetSysColor(COLOR_WINDOWTEXT),
+        .banner = GetSysColor(COLOR_WINDOW),
+        .banner_edge = GetSysColor(COLOR_HIGHLIGHT),
+        .ink = GetSysColor(COLOR_WINDOWTEXT),
+        .muted = GetSysColor(COLOR_GRAYTEXT),
+        .edge = GetSysColor(COLOR_WINDOWTEXT),
+        .hover = GetSysColor(COLOR_HOTLIGHT),
+        .active = GetSysColor(COLOR_HIGHLIGHT),
+        .active_ink = GetSysColor(COLOR_HIGHLIGHTTEXT),
+        .pressed = GetSysColor(COLOR_HIGHLIGHT),
         .accent = GetSysColor(COLOR_HIGHLIGHT),
-        .focus = GetSysColor(COLOR_HIGHLIGHT), .hint = GetSysColor(COLOR_WINDOW),
-        .hint_ink = GetSysColor(COLOR_WINDOWTEXT), .warning = GetSysColor(COLOR_WINDOWTEXT),
+        .accent_pressed = GetSysColor(COLOR_HIGHLIGHT),
+        .accent_ink = GetSysColor(COLOR_HIGHLIGHTTEXT),
+        .focus = GetSysColor(COLOR_HIGHLIGHT),
+        .hint = GetSysColor(COLOR_WINDOW),
+        .hint_ink = GetSysColor(COLOR_WINDOWTEXT),
+        .warning = GetSysColor(COLOR_WINDOWTEXT),
+        .success = GetSysColor(COLOR_HIGHLIGHT),
         .high_contrast = TRUE
     };
     return ui_normal_palette(dark != FALSE);
@@ -188,6 +202,7 @@ static void draw_icon(const DRAWITEMSTRUCT *item, const Panel *p) {
     if (!action_label(action)) return;
     int saved = SaveDC(dc);
     if (!saved) return;
+    BOOL is_confirm = action == ACT_COPY;
     BOOL selected = (action == ACT_SHAPES && p->tool <= DIAMOND) ||
                     (action == ACT_ARROW && p->tool == ARROW) || (action == ACT_PEN && p->tool == PEN) ||
                     (action == ACT_TEXT && p->tool == TEXT) || action == ACT_RECTANGLE + (int)p->shape ||
@@ -210,22 +225,32 @@ static void draw_icon(const DRAWITEMSTRUCT *item, const Panel *p) {
     if (inset > extent / 16) inset = extent / 16;
     RECT state = r;
     InflateRect(&state, -inset, -inset);
-    int radius = MulDiv(12, dpi, 96);
+    int radius = MulDiv(9, dpi, 96);
     if (radius > extent / 3) radius = extent / 3;
     BOOL hover = hot && !disabled && !active;
-    COLORREF face = active ? (pressed ? c->pressed : c->active) :
-                    hover && !c->high_contrast ? c->hover : c->surface;
-    if (face != c->surface) {
-        SetDCPenColor(dc, face);
-        SetDCBrushColor(dc, face);
-        RoundRect(dc, state.left, state.top, state.right, state.bottom, radius, radius);
+
+    COLORREF face = c->surface;
+    COLORREF ink = disabled ? c->muted : c->ink;
+    if (is_confirm && !disabled) {
+        UiFace cta = ui_accent_face(c, pressed || (c->high_contrast && hot));
+        face = cta.fill;
+        ink = cta.ink;
+        if (face != c->surface || c->high_contrast)
+            ui_aa_round_rect(dc, state, radius, c->surface, face,
+                             c->high_contrast ? c->ink : face, c->high_contrast);
+    } else {
+        face = active ? (pressed ? c->pressed : c->active) :
+               hover && !c->high_contrast ? c->hover : c->surface;
+        if (face != c->surface)
+            ui_aa_round_rect(dc, state, radius, c->surface, face, face, FALSE);
+        ink = disabled ? c->muted : active ? c->active_ink : c->ink;
     }
-    COLORREF ink = disabled ? c->muted : active ? c->active_ink : c->ink;
+
     aa_glyph(dc, r, dpi, action, p, ink, face);
-    if (hover && c->high_contrast) {
+    if (hover && c->high_contrast && !is_confirm) {
         SelectObject(dc, GetStockObject(NULL_BRUSH));
         SetDCPenColor(dc, c->ink);
-        RoundRect(dc, state.left, state.top, state.right, state.bottom, radius, radius);
+        RoundRect(dc, state.left, state.top, state.right, state.bottom, radius * 2, radius * 2);
     }
     if (item->itemState & ODS_FOCUS) DrawFocusRect(dc, &state);
     RestoreDC(dc, saved);
@@ -272,12 +297,13 @@ static LRESULT CALLBACK panel_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             SetDCBrushColor(dc, ui_colors.surface);
             SetDCPenColor(dc, ui_colors.edge);
             int dpi = (int)GetDpiForWindow(w);
-            int radius = MulDiv(20, dpi, 96);
-            if (r.right < radius || r.bottom < radius) Rectangle(dc, 0, 0, r.right, r.bottom);
-            else RoundRect(dc, 0, 0, r.right, r.bottom, radius, radius);
+            if (!dpi) dpi = 96;
+            int radius = MulDiv(12, dpi, 96);
+            if (r.right < radius * 2 || r.bottom < radius * 2) Rectangle(dc, 0, 0, r.right, r.bottom);
+            else ui_aa_round_rect(dc, r, radius, ui_colors.surface, ui_colors.surface, ui_colors.edge, TRUE);
             // Separate colors, history, and export without individual button borders.
             if (p && p->buttons[ACT_COPY] && GetDlgCtrlID(p->buttons[0]) == ACT_SHAPES + 1) {
-                SetDCPenColor(dc, ui_colors.high_contrast ? ui_colors.edge : ui_colors.hover);
+                SetDCPenColor(dc, ui_colors.high_contrast ? ui_colors.edge : ui_colors.card_edge);
                 for (int i = ACT_UNDO; i <= ACT_SAVE; i += ACT_SAVE - ACT_UNDO) {
                     RECT left, right;
                     if (!GetWindowRect(p->buttons[i-1], &left) || !GetWindowRect(p->buttons[i], &right) ||
@@ -316,7 +342,9 @@ BOOL register_panel(HINSTANCE instance) {
 
 static void panel_corner(HWND w, Dock d) {
     Rect b = d.bounds;
-    int radius = d.cell >= 24 ? MulDiv(20, (int)GetDpiForWindow(w), 96) : 0;
+    int dpi = (int)GetDpiForWindow(w);
+    if (!dpi) dpi = 96;
+    int radius = d.cell >= 24 ? MulDiv(24, dpi, 96) : 0;
     HRGN corner = radius ? CreateRoundRectRgn(0, 0, b.right-b.left+1, b.bottom-b.top+1, radius, radius) : NULL;
     if (!SetWindowRgn(w, corner, FALSE) && corner) DeleteObject(corner);
 }

@@ -64,6 +64,7 @@ type SettingsState = object
   updates: UpdateSnapshot
   updateFeedback: UpdateFeedback
   channelOpen: bool
+  activeTab: SettingsTab
   dark: bool
 let Settings = defineComponent[tuple[], State[SettingsState]]("Settings",
   proc(ctx: MountContext, props: tuple[]): State[SettingsState] =
@@ -130,13 +131,26 @@ let Settings = defineComponent[tuple[], State[SettingsState]]("Settings",
           result = old
           result.recording = true
           result.status = "")
+    let onSelectTab = proc(tab: SettingsTab) =
+      if tab == model.activeTab: return
+      if model.recording:
+        sg_record_hotkey(0)
+        recordKey = nil
+      discard session.update(proc(old: SettingsState): SettingsState =
+        result = old
+        result.activeTab = tab
+        result.channelOpen = false
+        if old.recording:
+          result.recording = false
+          result.status = "")
     let view = settingsView(model.chord, model.recording, model.status, model.trayReady,
       toggleRecording, proc(e: Event) = sg_exit(),
       proc(e: Event) = sg_settings_caption(0),
       proc(e: Event) = sg_settings_caption(1),
       startup = model.startup, startupError = model.startupError, onStartup = toggleStartup,
       update = UpdateUi(snapshot: model.updates, feedback: model.updateFeedback.message,
-        channelOpen: model.channelOpen, onChannelOpen: onChannelOpen, onAction: onUpdateAction))
+        channelOpen: model.channelOpen, onChannelOpen: onChannelOpen, onAction: onUpdateAction),
+      activeTab = model.activeTab, onSelectTab = onSelectTab)
     host(standard.theme((if model.dark: UiColorMode.dark else: UiColorMode.light), view)))
 
 proc requestUpdateRestart*(): bool =

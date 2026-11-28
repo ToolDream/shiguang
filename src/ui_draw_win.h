@@ -316,4 +316,35 @@ static inline void ui_aa_nav_icon(HDC dc, int x, int y, int side, BOOL updates_i
     ui_ssaa_present(&s, dc, x, y);
 }
 
+static inline void ui_aa_info_icon(HDC dc, int x, int y, int side,
+                                   COLORREF bg, COLORREF ink, int dpi) {
+    if (side <= 0) return;
+    UiSsaaSurface s;
+    if (!ui_ssaa_begin(&s, dc, side, side, bg)) return;
+    int sw = side * 4;
+    int pw = MulDiv(5, dpi, 96);
+    if (pw < 4) pw = 4;
+    LOGBRUSH lb = {BS_SOLID, ink, 0};
+    HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, pw, &lb, 0, NULL);
+    HGDIOBJ old_pen = pen ? SelectObject(s.dc, pen) : NULL;
+    HGDIOBJ old_brush = SelectObject(s.dc, GetStockObject(NULL_BRUSH));
+    int inset = pw / 2 + 2;
+    Ellipse(s.dc, inset, inset, sw - inset, sw - inset);
+    int cx = sw / 2;
+    MoveToEx(s.dc, cx, sw * 7 / 16, NULL);
+    LineTo(s.dc, cx, sw * 11 / 16);
+    SelectObject(s.dc, GetStockObject(DC_BRUSH));
+    SelectObject(s.dc, GetStockObject(DC_PEN));
+    SetDCBrushColor(s.dc, ink);
+    SetDCPenColor(s.dc, ink);
+    int dot_r = pw / 2;
+    if (dot_r < 2) dot_r = 2;
+    int dot_y = sw * 5 / 16;
+    Ellipse(s.dc, cx - dot_r, dot_y - dot_r, cx + dot_r, dot_y + dot_r);
+    if (old_brush) SelectObject(s.dc, old_brush);
+    if (old_pen) SelectObject(s.dc, old_pen);
+    if (pen) DeleteObject(pen);
+    ui_ssaa_present(&s, dc, x, y);
+}
+
 #endif

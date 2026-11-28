@@ -45,7 +45,46 @@ proc requireSettingsGeometry(view: Node) =
   for dpi in [96, 144]:
     let quit = pixelEdges(box("quit").rect, dpi)
     let sidebarRight = (settingsSidebarWidth - 14) * dpi div 96
-    let cardRight = (settingsWidth - 36) * dpi div 96
+    let cardRight = (settingsWidth - 32) * dpi div 96
+    let fullWidth = settingsWidth * dpi div 96
+    let captionRow = pixelEdges(box("caption-row").rect, dpi)
+    let caption = pixelEdges(box("caption").rect, dpi)
+    let minimize = pixelEdges(box("minimize").rect, dpi)
+    let close = pixelEdges(box("close").rect, dpi)
+    let captionDivider = pixelEdges(box("caption-divider").rect, dpi)
+    let sidebar = pixelEdges(box("sidebar").rect, dpi)
+    let body = pixelEdges(box("body").rect, dpi)
+    let navGeneral = pixelEdges(box("nav-general").rect, dpi)
+    doAssert captionRow.left == 0 and captionRow.top == 0 and captionRow.right == fullWidth,
+      "title bar must span full window width"
+    doAssert captionRow.bottom - captionRow.top == settingsCaptionHeight * dpi div 96,
+      "title bar height must match unified header"
+    doAssert caption.left == 0 and caption.top == 0 and caption.bottom == captionRow.bottom,
+      "draggable caption strip must cover left brand and blank title area"
+    doAssert caption.right == minimize.left and minimize.right <= close.left and close.right == fullWidth,
+      "caption buttons must dock cleanly on the right"
+    doAssert minimize.right - minimize.left >= 42 * dpi div 96 and
+      minimize.bottom - minimize.top >= 36 * dpi div 96, "minimize hit target >= 42x36 dip"
+    doAssert close.right - close.left >= 42 * dpi div 96 and
+      close.bottom - close.top >= 36 * dpi div 96, "close hit target >= 42x36 dip"
+    doAssert captionDivider.left == 0 and captionDivider.right == fullWidth and
+      captionDivider.top >= captionRow.bottom, "title bar divider must separate header across both columns"
+    doAssert sidebar.left == 0 and sidebar.top >= captionDivider.bottom and
+      body.top >= captionDivider.bottom and sidebar.top == body.top,
+      "sidebar and content must start together below the unified title bar"
+    if ids.hasKey("general"):
+      let pageTitle = pixelEdges(box("general").rect, dpi)
+      doAssert abs(navGeneral.top - pageTitle.top) <= 4 * dpi div 96,
+        "first nav item must align with tightened general heading"
+      doAssert pageTitle.top - captionDivider.bottom <= 18 * dpi div 96,
+        "general heading top padding must stay tight"
+      let tip = pixelEdges(box("general-tip").rect, dpi)
+      let card = pixelEdges(box("general-settings").rect, dpi)
+      doAssert tip.top >= card.bottom, "tray note must stay below general settings card"
+    if ids.hasKey("software-update"):
+      let pageTitle = pixelEdges(box("software-update").rect, dpi)
+      doAssert abs(navGeneral.top - pageTitle.top) <= 4 * dpi div 96,
+        "first nav item must align with tightened update heading"
     doAssert quit.right == sidebarRight
     doAssert quit.bottom - quit.top == 34 * dpi div 96
     for key in ["nav-general", "nav-update"]:
@@ -75,7 +114,7 @@ proc requireSettingsGeometry(view: Node) =
         doAssert pixelEdges(box(key).rect, dpi).right == cardRight, "right edge: " & key
     if ids.hasKey("update-check"):
       let checkButton = pixelEdges(box("update-check").rect, dpi)
-      doAssert checkButton.left >= (settingsSidebarWidth + 36) * dpi div 96, "check button inside the card"
+      doAssert checkButton.left >= (settingsSidebarWidth + 32) * dpi div 96, "check button inside the card"
       doAssert checkButton.right <= cardRight, "check button right edge"
       for key in ["update-action", "update-cancel"]:
         if not ids.hasKey(key): continue
@@ -88,7 +127,8 @@ proc requireSettingsGeometry(view: Node) =
     if ids.hasKey("auto-download-label") and ids.hasKey("auto-download"):
       doAssert pixelEdges(box("auto-download-label").rect, dpi).left <
         pixelEdges(box("auto-download").rect, dpi).left
-    for key in ["nav-general", "nav-update", "tray", "quit", "change", "unregistered",
+    for key in ["caption-row", "caption", "caption-divider", "minimize", "close",
+        "nav-general", "nav-update", "tray", "quit", "change", "unregistered",
         "general-divider", "startup", "startup-status", "general-tip",
         "software-update", "installed-version", "channel-divider",
         "update-channel-trigger", "auto-download", "update-action", "update-progress",
@@ -103,10 +143,17 @@ proc requireSettingsGeometry(view: Node) =
         pixels.right <= clip.right and pixels.bottom <= clip.bottom, "clipped control: " & key
 
 let win32 = win32Capabilities(shadcnLight)
+doAssert settingsTitle == "拾光截图 · 设置", "unified title bar must use middle-dot brand title"
 var selectedTab = stGeneral
 let initialView = settingsView(0x0653'u32, false, "", true, nil, nil,
   activeTab = stGeneral, onSelectTab = proc(tab: SettingsTab) = selectedTab = tab)
+doAssert find(initialView, "brand-title") == nil, "sidebar must not duplicate brand header"
+doAssert find(initialView, "caption-divider") != nil, "title bar must separate header from columns"
+doAssert find(initialView, "caption").text == "拾光截图 · 设置"
 doAssert find(initialView, "general") != nil, "general tab must show general preferences"
+doAssert find(initialView, "general-subtitle").text == "管理截图快捷键与 Windows 登录启动设置。"
+doAssert find(initialView, "startup-description").text == "开机自动驻留托盘，不弹出设置窗口。"
+doAssert find(initialView, "general-tip").text == "关闭设置窗口后，拾光仍在托盘待命。"
 doAssert find(initialView, "nav-general") != nil and find(initialView, "nav-update") != nil,
   "sidebar must expose both navigation tabs"
 find(initialView, "nav-update").handler(EventKind.click)(Event(kind: click))
@@ -118,13 +165,22 @@ find(initialUpdateView, "nav-general").handler(EventKind.click)(Event(kind: clic
 doAssert selectedTab == stGeneral
 
 for (chord, recording, status, trayReady, expected, absent) in [
-    (0x0653'u32, false, "", true, @["Ctrl", "Shift", "S", "更改"], @["未注册", "取消录入"]),
-    (0x0f20'u32, false, "", true, @["Ctrl", "Alt", "Shift", "Win", "Space", "更改"], @["未注册"]),
-    (0'u32, false, "", false, @["未注册", "●  通知区域图标不可用", "更改"], @["Ctrl"]),
-    (0x0653'u32, true, "", true, @["请按下新组合键  ·  Esc 取消", "取消录入"], @["Ctrl", "更改"]),
+    (0x0653'u32, false, "", true,
+      @["Ctrl", "Shift", "S", "更改", "关闭设置窗口后，拾光仍在托盘待命。"],
+      @["未注册", "取消录入", "通知区域图标不可用，暂时无法关闭设置窗口。"]),
+    (0x0f20'u32, false, "", true,
+      @["Ctrl", "Alt", "Shift", "Win", "Space", "更改", "关闭设置窗口后，拾光仍在托盘待命。"],
+      @["未注册", "通知区域图标不可用，暂时无法关闭设置窗口。"]),
+    (0'u32, false, "", false,
+      @["未注册", "●  通知区域图标不可用", "更改", "通知区域图标不可用，暂时无法关闭设置窗口。"],
+      @["Ctrl", "关闭设置窗口后，拾光仍在托盘待命。"]),
+    (0x0653'u32, true, "", true,
+      @["请按下新组合键  ·  Esc 取消", "取消录入", "关闭设置窗口后，拾光仍在托盘待命。"],
+      @["Ctrl", "更改", "通知区域图标不可用，暂时无法关闭设置窗口。"]),
     (0x0653'u32, false, shortcutFeedback(1, 0x0653), true,
-      @["Ctrl", "Shift", "S", "ⓘ  新组合键已被占用，仍使用 Ctrl + Shift + S。", "重新录入"],
-      @["取消录入", "更改"])]:
+      @["Ctrl", "Shift", "S", "ⓘ  新组合键已被占用，仍使用 Ctrl + Shift + S。", "重新录入",
+        "关闭设置窗口后，拾光仍在托盘待命。"],
+      @["取消录入", "更改", "通知区域图标不可用，暂时无法关闭设置窗口。"])]:
   let view = settingsView(chord, recording, status, trayReady, nil, nil, activeTab = stGeneral)
   let minimize = find(view, "minimize")
   let close = find(view, "close")
@@ -690,6 +746,37 @@ when defined(windows) and defined(amd64):
         " budgetExceeded=" & $budgetExceeded
     # Initial turn runs through window.pump() + bindSettingsSafeTick (no manual sg_style_settings call).
     pumpBounded(11, "initial-mount")
+    let minBtn = buttonByText(root, "最小化")
+    let closeBtn = buttonByText(root, "关闭")
+    doAssert minBtn != nil and closeBtn != nil,
+      "expected caption buttons: min=" & $(minBtn != nil) & " close=" & $(closeBtn != nil)
+    doAssert settingsFaceProp(minBtn) == 4'u and settingsFaceProp(closeBtn) == 5'u,
+      "unexpected caption button faces: min=" & $settingsFaceProp(minBtn) &
+      " close=" & $settingsFaceProp(closeBtn)
+    var minRect, closeRect, rootRect: RECT
+    doAssert GetWindowRect(minBtn, addr minRect) != 0 and
+      GetWindowRect(closeBtn, addr closeRect) != 0 and
+      GetWindowRect(root, addr rootRect) != 0
+    const ProbeWmNcHitTest = 0x0084'u32
+    const ProbeHtClient = 1
+    const ProbeHtCaption = 2
+    let capMidY = (minRect.top + minRect.bottom) div 2
+    let brandX = rootRect.left + 28
+    let blankX = minRect.left - 32
+    doAssert SendMessageW(root, ProbeWmNcHitTest, 0,
+      LPARAM((capMidY shl 16) or (brandX and 0xffff))) == ProbeHtCaption,
+      "brand area in unified title bar must hit HTCAPTION"
+    doAssert SendMessageW(root, ProbeWmNcHitTest, 0,
+      LPARAM((capMidY shl 16) or (blankX and 0xffff))) == ProbeHtCaption,
+      "blank area in unified title bar must hit HTCAPTION"
+    let minMidX = (minRect.left + minRect.right) div 2
+    let closeMidX = (closeRect.left + closeRect.right) div 2
+    doAssert SendMessageW(root, ProbeWmNcHitTest, 0,
+      LPARAM((capMidY shl 16) or (minMidX and 0xffff))) == ProbeHtClient,
+      "minimize button must not hit HTCAPTION"
+    doAssert SendMessageW(root, ProbeWmNcHitTest, 0,
+      LPARAM((capMidY shl 16) or (closeMidX and 0xffff))) == ProbeHtClient,
+      "close button must not hit HTCAPTION"
     let navGeneral = buttonByText(root, "常规")
     let navUpdate = buttonByText(root, "软件更新")
     doAssert navGeneral != nil and navUpdate != nil,

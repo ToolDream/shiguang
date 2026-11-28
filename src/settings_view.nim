@@ -117,16 +117,17 @@ proc lastCheckLabel(stamp: int64): string =
   else: fromUnix(stamp).local.format("yyyy-MM-dd HH:mm")
 
 const
-  settingsTitle* = "拾光截图 / 设置"
+  settingsTitle* = "拾光截图 · 设置"
   settingsWidth* = 680
   settingsHeight* = 436
   settingsSidebarWidth* = 180
+  settingsCaptionHeight* = 44
 
 proc settingsCard(key: string, children: seq[Node], gap = "12"): Node =
   ui(NodeKind.column, key = key, children = children, attributes = standard.card(@[]).attributes,
     styles = style({"width": "full", "padding": "16", "gap": gap}))
 
-proc generalPage(chord: uint32, recording: bool, status: string,
+proc generalPage(chord: uint32, recording: bool, status: string, trayReady: bool,
                  toggleRecording: Callback, startup: cint, startupError: bool,
                  onStartup: Callback): seq[Node] =
   let entry = if recording:
@@ -166,7 +167,7 @@ proc generalPage(chord: uint32, recording: bool, status: string,
       column(@[
         text("登录 Windows 时启动拾光", key = "startup-label",
           styles = style({"width": "full", "height": "20"})),
-        text("开机自动静默驻留托盘，不弹出设置窗口", key = "startup-description",
+        text("开机自动驻留托盘，不弹出设置窗口。", key = "startup-description",
           styles = style({"width": "full", "height": "18"}))
       ], key = "startup-labels", styles = style({"width": "full", "flex_grow": "1", "gap": "2"})),
       leaf.switch("登录 Windows 时启动拾光", checked = startup == 1, key = "startup",
@@ -175,16 +176,18 @@ proc generalPage(chord: uint32, recording: bool, status: string,
     ], key = "startup-row", styles = style({"width": "full", "height": "40", "gap": "12",
       "justify": "between", "align": "center"}))
   ] & startupFeedback, gap = "10")
+  let trayNote = if trayReady: "关闭设置窗口后，拾光仍在托盘待命。"
+    else: "通知区域图标不可用，暂时无法关闭设置窗口。"
   @[
     column(@[
-      text("常规", key = "general", styles = style({"width": "full", "height": "26"})),
-      text("快捷键与系统启动项设置，关闭本窗口后拾光仍在托盘待命。", key = "general-subtitle",
+      text("常规", key = "general", styles = style({"width": "full", "height": "28"})),
+      text("管理截图快捷键与 Windows 登录启动设置。", key = "general-subtitle",
         styles = style({"width": "full", "height": "18"}))
     ], key = "general-header", styles = style({"width": "full", "gap": "2"})),
     generalCard,
     column(@[], key = "general-spacer", styles = style({"width": "full", "height": "full", "flex_grow": "1"})),
-    text("提示：在截图编辑中按 Enter 直接复制，Ctrl + S 另存为 PNG。", key = "general-tip",
-      styles = style({"width": "full", "height": "18"}))
+    text(trayNote, key = "general-tip",
+      styles = style({"width": "full", "height": "24"}))
   ]
 
 proc updatePage(update: UpdateUi): seq[Node] =
@@ -270,7 +273,7 @@ proc updatePage(update: UpdateUi): seq[Node] =
   let switchStyle = style({"width": "44", "height": "28"})
   @[
     row(@[
-      text("软件更新", key = "software-update", styles = style({"width": "104", "height": "26"})),
+      text("软件更新", key = "software-update", styles = style({"width": "108", "height": "28"})),
       text("当前版本 " & buildLabel(snapshot.installed), key = "installed-version",
         styles = style({"width": "full", "flex_grow": "1", "height": "20"}))
     ], key = "update-header", styles = style({"width": "full", "height": "28", "gap": "12",
@@ -325,14 +328,20 @@ proc settingsView*(chord: uint32, recording: bool, status: string, trayReady: bo
     else: "●  通知区域图标不可用"
   let hasNewUpdate = update.snapshot.phase in {upAvailable, upReady}
   let updateNavLabel = if hasNewUpdate: "软件更新  ·  新版本" else: "软件更新"
-  let navButtonStyle = style({"width": "full", "height": "34"})
-  let captionButton = style({"width": "42", "height": "36"})
+  let navButtonStyle = style({"width": "full", "height": "36"})
+  let captionButton = style({"width": "44", "height": $settingsCaptionHeight})
   let selectGeneral: Callback = proc(e: Event) =
     if onSelectTab != nil: onSelectTab(stGeneral)
   let selectUpdate: Callback = proc(e: Event) =
     if onSelectTab != nil: onSelectTab(stUpdate)
+  let captionRow = row(@[
+    text(settingsTitle, key = "caption", styles = style({"width": "full",
+      "height": $settingsCaptionHeight, "flex_grow": "1"})),
+    leaf.button("最小化", key = "minimize", onClick = minimize, styles = captionButton),
+    leaf.button("关闭", key = "close", onClick = close, styles = captionButton)
+  ], key = "caption-row", styles = style({"width": "full", "height": $settingsCaptionHeight,
+    "align": "center"}))
   let sidebar = column(@[
-    text("拾光截图", key = "brand-title", styles = style({"width": "full", "height": "42"})),
     column(@[
       leaf.button("常规", key = "nav-general", onClick = selectGeneral, styles = navButtonStyle),
       leaf.button(updateNavLabel, key = "nav-update", onClick = selectUpdate, styles = navButtonStyle)
@@ -346,19 +355,17 @@ proc settingsView*(chord: uint32, recording: bool, status: string, trayReady: bo
     "padding": "14", "gap": "8"}))
   let bodyChildren = case activeTab
     of stGeneral:
-      generalPage(chord, recording, status, toggleRecording, startup, startupError, onStartup)
+      generalPage(chord, recording, status, trayReady, toggleRecording, startup, startupError, onStartup)
     of stUpdate:
       updatePage(update)
-  let mainPane = column(@[
-    row(@[
-      text(settingsTitle, key = "caption", styles = style({"width": "full", "height": "36", "flex_grow": "1"})),
-      leaf.button("最小化", key = "minimize", onClick = minimize, styles = captionButton),
-      leaf.button("关闭", key = "close", onClick = close, styles = captionButton)
-    ], key = "caption-row", styles = style({"width": "full", "height": "36", "align": "center"})),
-    column(bodyChildren, key = "body", styles = style({"width": "full", "height": "full", "flex_grow": "1",
-      "padding": "20", "gap": "12"}))
-  ], key = "main-pane", styles = style({"width": "full", "flex_grow": "1", "height": "full"}))
-  row(@[sidebar, mainPane], key = "settings", styles = style({"width": "full", "height": "full"}))
+  let body = column(bodyChildren, key = "body", styles = style({"width": "full",
+    "height": "full", "flex_grow": "1", "padding": "16", "gap": "12"}))
+  column(@[
+    captionRow,
+    standard.separator(key = "caption-divider"),
+    row(@[sidebar, body], key = "workspace", styles = style({"width": "full",
+      "height": "full", "flex_grow": "1"}))
+  ], key = "settings", styles = style({"width": "full", "height": "full"}))
 
 type
   SettingsStyleSync* = object

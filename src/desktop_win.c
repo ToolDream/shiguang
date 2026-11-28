@@ -1393,9 +1393,9 @@ enum SettingsFace {
     SETTINGS_MIN, SETTINGS_CLOSE, SETTINGS_NAV_ACTIVE, SETTINGS_NAV_IDLE, SETTINGS_SWITCH,
     SETTINGS_TITLE, SETTINGS_BRAND, SETTINGS_PAGE_TITLE, SETTINGS_LABEL,
     SETTINGS_STATUS_BOLD, SETTINGS_STATUS_READY,
-    SETTINGS_MUTED, SETTINGS_MUTED_RIGHT, SETTINGS_PLUS, SETTINGS_TRAY, SETTINGS_FEEDBACK,
-    SETTINGS_KEYCAP, SETTINGS_DIVIDER, SETTINGS_SIDEBAR, SETTINGS_CARD_BOX, SETTINGS_BANNER_BOX,
-    SETTINGS_WRAPPER
+    SETTINGS_MUTED, SETTINGS_MUTED_RIGHT, SETTINGS_PLUS, SETTINGS_TRAY, SETTINGS_INFO_NOTE,
+    SETTINGS_FEEDBACK, SETTINGS_KEYCAP, SETTINGS_DIVIDER, SETTINGS_SIDEBAR, SETTINGS_CARD_BOX,
+    SETTINGS_BANNER_BOX, SETTINGS_WRAPPER
 };
 enum SettingsBg { BG_SURFACE = 1, BG_SIDEBAR = 2, BG_CARD = 3, BG_BANNER = 4 };
 // Ordinals from Leaf UiRole (+1 stored in Leaf.Ui.Role window property).
@@ -1461,6 +1461,7 @@ static void ensure_settings_palette(void) {
 
 typedef struct {
     int dpi;
+    HICON caption_icon;
     HFONT brand, page_title, status_bold, label, body, muted, badge;
 } SettingsFonts;
 static SettingsFonts settings_fonts;
@@ -1474,6 +1475,8 @@ static void clear_settings_fonts(void) {
         if (*list[i]) DeleteObject(*list[i]);
         *list[i] = NULL;
     }
+    if (settings_fonts.caption_icon) DestroyIcon(settings_fonts.caption_icon);
+    settings_fonts.caption_icon = NULL;
     settings_fonts.dpi = 0;
 }
 
@@ -1487,10 +1490,14 @@ static void ensure_settings_fonts(int dpi) {
     if (settings_fonts.dpi == dpi && settings_fonts.body) return;
     clear_settings_fonts();
     settings_fonts.dpi = dpi;
-    settings_fonts.brand = make_ui_font(15, dpi, FW_SEMIBOLD);
-    settings_fonts.page_title = make_ui_font(18, dpi, FW_BOLD);
+    int cap_side = MulDiv(20, dpi, 96);
+    if (instance && cap_side > 0)
+        settings_fonts.caption_icon = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(IDI_SHIGUANG),
+            IMAGE_ICON, cap_side, cap_side, LR_DEFAULTCOLOR);
+    settings_fonts.brand = make_ui_font(14, dpi, FW_SEMIBOLD);
+    settings_fonts.page_title = make_ui_font(21, dpi, FW_BOLD);
     settings_fonts.status_bold = make_ui_font(14, dpi, FW_SEMIBOLD);
-    settings_fonts.label = make_ui_font(14, dpi, FW_NORMAL);
+    settings_fonts.label = make_ui_font(14, dpi, FW_SEMIBOLD);
     settings_fonts.body = make_ui_font(13, dpi, FW_NORMAL);
     settings_fonts.muted = make_ui_font(12, dpi, FW_NORMAL);
     settings_fonts.badge = make_ui_font(10, dpi, FW_SEMIBOLD);
@@ -1509,12 +1516,16 @@ static COLORREF bg_color_for(uintptr_t kind, const SettingsPalette *c) {
     }
 }
 
-static COLORREF settings_parent_bg(HWND w, const SettingsPalette *c) {
+static uintptr_t settings_parent_bg_kind(HWND w) {
     for (HWND cur = GetParent(w); cur && cur != settings; cur = GetParent(cur)) {
         uintptr_t kind = (uintptr_t)GetPropW(cur, settings_bg_key);
-        if (kind) return bg_color_for(kind, c);
+        if (kind) return kind;
     }
-    return c->surface;
+    return BG_SURFACE;
+}
+
+static COLORREF settings_parent_bg(HWND w, const SettingsPalette *c) {
+    return bg_color_for(settings_parent_bg_kind(w), c);
 }
 
 static BOOL settings_is_button_face(DWORD_PTR face) {
@@ -1551,7 +1562,7 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
         BOOL banner = id == SETTINGS_BANNER_BOX;
         COLORREF fill = banner ? c->banner : c->card;
         COLORREF border = banner ? c->banner_edge : c->card_edge;
-        ui_aa_round_rect(dc, r, MulDiv(9, dpi, 96), c->surface, fill, border, TRUE);
+        ui_aa_round_rect(dc, r, MulDiv(10, dpi, 96), c->surface, fill, border, TRUE);
         RestoreDC(dc, saved);
         return;
     }
@@ -1565,7 +1576,8 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
         return;
     }
 
-    COLORREF bg = settings_parent_bg(w, c);
+    uintptr_t parent_bg_kind = settings_parent_bg_kind(w);
+    COLORREF bg = bg_color_for(parent_bg_kind, c);
     POINT p;
     BOOL hot = GetCursorPos(&p) && WindowFromPoint(p) == w;
     BOOL pressed = settings_is_button_face(id) &&
@@ -1579,7 +1591,8 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
     FillRect(dc, &r, GetStockObject(DC_BRUSH));
 
     if (id == SETTINGS_DIVIDER) {
-        SetDCBrushColor(dc, hc ? c->edge : c->divider);
+        COLORREF line = hc ? c->edge : (parent_bg_kind == BG_SURFACE ? c->card_edge : c->divider);
+        SetDCBrushColor(dc, line);
         FillRect(dc, &r, GetStockObject(DC_BRUSH));
         RestoreDC(dc, saved);
         return;
@@ -1587,16 +1600,33 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
 
     if (id == SETTINGS_MIN || id == SETTINGS_CLOSE) {
         COLORREF btn_bg = bg;
+        int pad_x = MulDiv(4, dpi, 96), pad_y = MulDiv(5, dpi, 96);
+        RECT pill = {r.left + pad_x, r.top + pad_y, r.right - pad_x, r.bottom - pad_y};
+        if (pill.right <= pill.left || pill.bottom <= pill.top) pill = r;
         if (hot || pressed) {
-            btn_bg = hc ? c->active : (id == SETTINGS_CLOSE ? RGB(220, 38, 38) : c->hover);
-            SetDCBrushColor(dc, btn_bg);
-            FillRect(dc, &r, GetStockObject(DC_BRUSH));
-            if (hc) ink = c->active_ink;
-            else if (id == SETTINGS_CLOSE) ink = RGB(255, 255, 255);
+            if (hc) {
+                btn_bg = c->active;
+                ink = c->active_ink;
+            } else if (id == SETTINGS_CLOSE) {
+                btn_bg = pressed ? RGB(190, 28, 28) : RGB(220, 38, 38);
+                ink = RGB(255, 255, 255);
+            } else {
+                btn_bg = pressed ? c->pressed : c->hover;
+                ink = c->ink;
+            }
+            ui_aa_round_rect(dc, pill, MulDiv(6, dpi, 96), bg, btn_bg,
+                             hc ? c->ink : btn_bg, hc);
         } else if (!hc) {
             ink = c->muted;
         }
-        ui_aa_caption_glyph(dc, r, id == SETTINGS_CLOSE, btn_bg, ink, dpi);
+        int gw = MulDiv(16, dpi, 96), gh = gw;
+        int max_w = (pill.right - pill.left) - (hc ? 2 : 0);
+        int max_h = (pill.bottom - pill.top) - (hc ? 2 : 0);
+        if (gw > max_w) gw = max_w;
+        if (gh > max_h) gh = max_h;
+        int gcx = (pill.left + pill.right) / 2, gcy = (pill.top + pill.bottom) / 2;
+        RECT glyph = {gcx - gw / 2, gcy - gh / 2, gcx - gw / 2 + gw, gcy - gh / 2 + gh};
+        ui_aa_caption_glyph(dc, glyph, id == SETTINGS_CLOSE, btn_bg, ink, dpi);
     } else if (id == SETTINGS_SWITCH) {
         BOOL on = SendMessageW(w, BM_GETCHECK, 0, 0) == BST_CHECKED;
         ui_aa_switch(dc, r, bg, on, disabled, c, dpi);
@@ -1641,14 +1671,25 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
             ink = active ? c->active_ink : (hot ? c->ink : c->muted);
         }
         if (fill != bg || (hc && active))
-            ui_aa_round_rect(dc, r, MulDiv(7, dpi, 96), bg, fill,
+            ui_aa_round_rect(dc, r, MulDiv(8, dpi, 96), bg, fill,
                              hc ? c->ink : fill, hc && active);
+        if (active) {
+            int bar_w = MulDiv(3, dpi, 96);
+            if (bar_w < 2) bar_w = 2;
+            int bar_h = MulDiv(20, dpi, 96);
+            if (bar_h > r.bottom - MulDiv(8, dpi, 96)) bar_h = r.bottom - MulDiv(8, dpi, 96);
+            if (bar_h > 4) {
+                RECT bar = {r.left, (r.bottom - bar_h) / 2, r.left + bar_w, (r.bottom + bar_h) / 2};
+                COLORREF bar_color = hc ? c->active_ink : c->accent;
+                ui_aa_round_rect(dc, bar, bar_w, fill, bar_color, bar_color, FALSE);
+            }
+        }
         wchar_t caption[128] = {0};
         GetWindowTextW(w, caption, ARRAYSIZE(caption));
         BOOL is_updates = !wcsncmp(caption, L"软件更新", 4);
         BOOL has_badge = is_updates && wcsstr(caption, L"新版本") != NULL;
         int icon_side = MulDiv(15, dpi, 96);
-        int icon_x = MulDiv(11, dpi, 96);
+        int icon_x = MulDiv(13, dpi, 96);
         int icon_y = (r.bottom - icon_side) / 2;
         ui_aa_nav_icon(dc, icon_x, icon_y, icon_side, is_updates, fill, ink, dpi);
         HFONT font = active ? settings_fonts.status_bold : settings_fonts.body;
@@ -1690,19 +1731,50 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
         SetTextColor(dc, hc ? c->ink : c->muted);
         DrawTextW(dc, L"设置", -1, &sub_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     } else if (id == SETTINGS_TITLE) {
-        // Standalone test window (without sidebar) keeps classic title paint;
-        // dual-column layout shows branding in the sidebar and keeps this drag strip clean.
-        if (!settings_brand) {
-            int inset = MulDiv(18, dpi, 96), side = MulDiv(21, dpi, 96);
-            if (small_icon) DrawIconEx(dc, inset, (r.bottom - side) / 2, small_icon, side, side, 0, NULL, DI_NORMAL);
-            RECT tr = r;
-            tr.left = inset + side + MulDiv(10, dpi, 96);
-            if (settings_fonts.status_bold) SelectObject(dc, settings_fonts.status_bold);
-            SetBkMode(dc, TRANSPARENT);
+        int side = MulDiv(20, dpi, 96);
+        int ix = MulDiv(16, dpi, 96), iy = (r.bottom - side) / 2;
+        HICON cap_icon = settings_fonts.caption_icon ? settings_fonts.caption_icon
+            : (large_icon ? large_icon : small_icon);
+        if (cap_icon) DrawIconEx(dc, ix, iy, cap_icon, side, side, 0, NULL, DI_NORMAL);
+        int tx = ix + side + MulDiv(10, dpi, 96);
+        SetBkMode(dc, TRANSPARENT);
+        wchar_t caption[128] = {0};
+        int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
+        const WCHAR *sep = wcsstr(caption, L" · ");
+        if (!sep) sep = wcsstr(caption, L" / ");
+        if (sep && sep > caption) {
+            int left_len = (int)(sep - caption);
+            const WCHAR *right_text = sep + 3;
+            int right_len = (int)wcslen(right_text);
+            if (settings_fonts.brand) SelectObject(dc, settings_fonts.brand);
             SetTextColor(dc, c->ink);
-            wchar_t caption[128] = {0};
-            int n = GetWindowTextW(w, caption, ARRAYSIZE(caption));
-            if (n) DrawTextW(dc, caption, n, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SIZE left_sz = {0};
+            GetTextExtentPoint32W(dc, caption, left_len, &left_sz);
+            RECT left_r = {tx, r.top, tx + left_sz.cx + MulDiv(2, dpi, 96), r.bottom};
+            if (left_r.right > r.right) left_r.right = r.right;
+            DrawTextW(dc, caption, left_len, &left_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            int dot = MulDiv(3, dpi, 96);
+            if (dot < 3) dot = 3;
+            int dot_x = left_r.right + MulDiv(7, dpi, 96);
+            if (dot_x + dot < r.right) {
+                RECT dr = {dot_x, (r.bottom - dot) / 2, dot_x + dot, (r.bottom + dot) / 2};
+                COLORREF dot_color = hc ? c->ink : c->muted;
+                ui_aa_circle(dc, dr, bg, dot_color, dot_color, 0);
+                if (right_len > 0) {
+                    if (settings_fonts.body) SelectObject(dc, settings_fonts.body);
+                    SetTextColor(dc, hc ? c->ink : c->muted);
+                    RECT right_r = {dr.right + MulDiv(8, dpi, 96), r.top, r.right - MulDiv(8, dpi, 96), r.bottom};
+                    if (right_r.right > right_r.left)
+                        DrawTextW(dc, right_text, right_len, &right_r,
+                                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                }
+            }
+        } else if (n > 0) {
+            RECT tr = {tx, r.top, r.right - MulDiv(8, dpi, 96), r.bottom};
+            if (settings_fonts.brand) SelectObject(dc, settings_fonts.brand);
+            SetTextColor(dc, c->ink);
+            if (tr.right > tr.left)
+                DrawTextW(dc, caption, n, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         }
     } else if (id == SETTINGS_SECONDARY_BTN || id == SETTINGS_ACCENT_BTN || id == SETTINGS_KEYCAP) {
         BOOL accent = id == SETTINGS_ACCENT_BTN;
@@ -1774,6 +1846,14 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
                 ++draw_text; --draw_len;
                 while (draw_len > 0 && draw_text[0] == L' ') { ++draw_text; --draw_len; }
             }
+        } else if (id == SETTINGS_INFO_NOTE) {
+            font = settings_fonts.muted;
+            ink = hc ? c->ink : c->muted;
+            int icon_side = MulDiv(14, dpi, 96);
+            int icon_x = r.left;
+            int icon_y = (r.bottom - icon_side) / 2;
+            ui_aa_info_icon(dc, icon_x, icon_y, icon_side, bg, ink, dpi);
+            tr.left = icon_x + icon_side + MulDiv(7, dpi, 96);
         } else if (id == SETTINGS_FEEDBACK) {
             font = settings_fonts.muted;
             ink = c->warning;
@@ -1801,7 +1881,7 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
         !(SendMessageW(w, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
         RECT fr;
         GetClientRect(w, &fr);
-        int rad = MulDiv(id == SETTINGS_NAV_ACTIVE || id == SETTINGS_NAV_IDLE ? 7 : 6, dpi, 96) * 2;
+        int rad = MulDiv(id == SETTINGS_NAV_ACTIVE || id == SETTINGS_NAV_IDLE ? 8 : 6, dpi, 96) * 2;
         if (id == SETTINGS_SWITCH) {
             int track_h = MulDiv(23, dpi, 96), track_w = MulDiv(42, dpi, 96);
             if (track_w > fr.right) track_w = fr.right;
@@ -1813,6 +1893,16 @@ static void paint_settings_face(HWND w, HDC dc, DWORD_PTR id) {
             if (fr.top < 0) fr.top = 0;
             if (fr.bottom > r.bottom) fr.bottom = r.bottom;
             rad = fr.bottom - fr.top;
+        } else if (id == SETTINGS_MIN || id == SETTINGS_CLOSE) {
+            int pad_x = MulDiv(4, dpi, 96), pad_y = MulDiv(5, dpi, 96);
+            if (fr.right - fr.left > pad_x * 2 + 4 && fr.bottom - fr.top > pad_y * 2 + 4) {
+                fr.left += pad_x;
+                fr.top += pad_y;
+                fr.right -= pad_x;
+                fr.bottom -= pad_y;
+            } else {
+                InflateRect(&fr, -1, -1);
+            }
         } else {
             InflateRect(&fr, -1, -1);
         }
@@ -1934,10 +2024,7 @@ static BOOL CALLBACK scan_settings_layout(HWND w, LPARAM lp) {
         if (!wcscmp(label, L"软件更新") || !wcscmp(label, L"更新通道")) {
             scan->update_tab_active = TRUE;
         }
-        if (!wcscmp(label, L"拾光截图")) {
-            HWND p = nth_ancestor_in_settings(w, 1);
-            if (p && !scan->sidebar) scan->sidebar = p;
-        } else if (!wcscmp(label, L"区域截图快捷键")) {
+        if (!wcscmp(label, L"区域截图快捷键")) {
             add_card_hwnd(scan, card_ancestor_in_settings(w, 2));
         } else if (!wcscmp(label, L"登录 Windows 时启动拾光")) {
             add_card_hwnd(scan, card_ancestor_in_settings(w, 3));
@@ -1957,6 +2044,9 @@ static BOOL CALLBACK scan_settings_layout(HWND w, LPARAM lp) {
     } else if (!wcscmp(klass, L"Button")) {
         if (!wcscmp(label, L"退出拾光")) {
             HWND p = nth_ancestor_in_settings(w, 1);
+            if (p) scan->sidebar = p;
+        } else if (!wcscmp(label, L"常规") && !scan->sidebar) {
+            HWND p = nth_ancestor_in_settings(w, 2);
             if (p) scan->sidebar = p;
         }
     }
@@ -2023,7 +2113,7 @@ static BOOL CALLBACK style_settings_controls(HWND w, LPARAM lp) {
                 face = SETTINGS_WRAPPER;
         } else if (role == LEAF_ROLE_KBD) {
             face = SETTINGS_KEYCAP;
-        } else if (!wcscmp(label, L"拾光截图 / 设置")) {
+        } else if (!wcscmp(label, L"拾光截图 · 设置") || !wcscmp(label, L"拾光截图 / 设置")) {
             face = SETTINGS_TITLE;
             settings_title = w;
         } else if (!wcscmp(label, L"拾光截图")) {
@@ -2033,6 +2123,8 @@ static BOOL CALLBACK style_settings_controls(HWND w, LPARAM lp) {
             face = SETTINGS_PAGE_TITLE;
         } else if (label[0] == L'●') {
             face = SETTINGS_TRAY;
+        } else if (!wcsncmp(label, L"关闭设置窗口后", 7) || !wcsncmp(label, L"通知区域图标不可用，", 10)) {
+            face = SETTINGS_INFO_NOTE;
         } else if (label[0] == L'ⓘ' || !wcsncmp(label, L"无法", 2) || !wcsncmp(label, L"已有", 2)) {
             face = SETTINGS_FEEDBACK;
         } else if ((n == 1 && ((label[0] >= L'A' && label[0] <= L'Z') ||
@@ -2111,6 +2203,8 @@ uint32_t sg_settings_popup_color(int slot) {
 void sg_style_settings(void) {
     if (settings) {
         ensure_settings_palette();
+        settings_title = NULL;
+        settings_brand = NULL;
         SettingsLayoutScan scan = {0};
         EnumChildWindows(settings, scan_settings_layout, (LPARAM)&scan);
         if (scan.sidebar) SetPropW(scan.sidebar, settings_bg_key, (HANDLE)(uintptr_t)BG_SIDEBAR);

@@ -536,12 +536,41 @@ when defined(windows) and defined(amd64):
   proc GetPropW(w: HWND, name: WidePtr): HANDLE
   {.pop.}
 
+  const ProbeBsTypeMask = 0x0F'u32
+
+  proc windowClass(w: HWND): string =
+    var buf: array[64, WCHAR]
+    let n = GetClassNameW(w, addr buf[0], int32(buf.len))
+    if n <= 0: return ""
+    result = newString(n)
+    for i in 0 ..< n:
+      let ch = buf[i]
+      result[i] = if ch <= 0x7f'u16: char(ch) else: '?'
+
+  proc isClassAscii(w: HWND, expected: cstring): bool {.raises: [].} =
+    var buf: array[64, WCHAR]
+    let n = GetClassNameW(w, addr buf[0], int32(buf.len))
+    if n <= 0 or int(n) != expected.len: return false
+    for i in 0 ..< int(n):
+      var a = buf[i]
+      if a >= uint16(ord('A')) and a <= uint16(ord('Z')): a += 32'u16
+      var b = uint16(ord(expected[i]))
+      if b >= uint16(ord('A')) and b <= uint16(ord('Z')): b += 32'u16
+      if a != b: return false
+    true
+
+  proc buttonType(w: HWND): uint32 {.raises: [].} =
+    uint32(GetWindowLongPtrW(w, GWL_STYLE) and int(ProbeBsTypeMask))
+
   type ChildLookup = object
     wanted: WideCString
+    className: cstring
     found: HWND
 
-  proc findChildByText(w: HWND, lp: LPARAM): BOOL {.stdcall.} =
+  proc findChildByClassAndText(w: HWND, lp: LPARAM): BOOL {.stdcall.} =
     let lookup = cast[ptr ChildLookup](lp)
+    if lookup.className != nil and not isClassAscii(w, lookup.className):
+      return 1
     var buf: array[128, WCHAR]
     let n = GetWindowTextW(w, addr buf[0], int32(buf.len))
     if n > 0:
@@ -552,9 +581,9 @@ when defined(windows) and defined(amd64):
         return 0
     1
 
-  proc childByText(root: HWND, text: string): HWND =
-    var lookup = ChildLookup(wanted: newWideCString(text))
-    discard EnumChildWindows(root, findChildByText, cast[LPARAM](addr lookup))
+  proc buttonByText(root: HWND, text: string): HWND =
+    var lookup = ChildLookup(wanted: newWideCString(text), className: "Button")
+    discard EnumChildWindows(root, findChildByClassAndText, cast[LPARAM](addr lookup))
     lookup.found
 
   proc settingsFaceProp(w: HWND): uint =
@@ -661,10 +690,14 @@ when defined(windows) and defined(amd64):
         " budgetExceeded=" & $budgetExceeded
     # Initial turn runs through window.pump() + bindSettingsSafeTick (no manual sg_style_settings call).
     pumpBounded(11, "initial-mount")
-    let navGeneral = childByText(root, "常规")
-    let navUpdate = childByText(root, "软件更新")
-    doAssert navGeneral != nil and navUpdate != nil
-    doAssert settingsFaceProp(navGeneral) == 6'u and settingsFaceProp(navUpdate) == 7'u
+    let navGeneral = buttonByText(root, "常规")
+    let navUpdate = buttonByText(root, "软件更新")
+    doAssert navGeneral != nil and navUpdate != nil,
+      "expected sidebar nav buttons: navGeneral=" & $(navGeneral != nil) &
+      " navUpdate=" & $(navUpdate != nil)
+    doAssert settingsFaceProp(navGeneral) == 6'u and settingsFaceProp(navUpdate) == 7'u,
+      "unexpected initial nav faces: general=" & $settingsFaceProp(navGeneral) &
+      " update=" & $settingsFaceProp(navUpdate)
     # Click "软件更新" through native BM_CLICK -> WM_COMMAND -> WM_HOST_TICK -> safeTurn -> bindSettingsSafeTick.
     let revBefore = rt.acceptedRevision
     discard SendMessageW(navUpdate, BM_CLICK, 0, 0)
@@ -672,9 +705,22 @@ when defined(windows) and defined(amd64):
     doAssert hostTicks > 0, "expected WM_HOST_TICK after BM_CLICK, got hostTicks=" & $hostTicks
     doAssert rt.acceptedRevision > revBefore,
       "expected Leaf revision advance after BM_CLICK: before=" & $revBefore & " after=" & $rt.acceptedRevision
-    doAssert settingsFaceProp(navGeneral) == 7'u and settingsFaceProp(navUpdate) == 6'u
-    let channelBtn = childByText(root, "测试版")
-    let autoSwitch = childByText(root, "自动下载更新")
-    doAssert channelBtn != nil and settingsFaceProp(channelBtn) == 3'u
-    doAssert autoSwitch != nil and settingsFaceProp(autoSwitch) == 8'u
+    doAssert settingsFaceProp(navGeneral) == 7'u and settingsFaceProp(navUpdate) == 6'u,
+      "unexpected post-switch nav faces: general=" & $settingsFaceProp(navGeneral) &
+      " update=" & $settingsFaceProp(navUpdate)
+    let channelBtn = buttonByText(root, "测试版")
+    let autoSwitch = buttonByText(root, "自动下载更新")
+    doAssert channelBtn != nil and settingsFaceProp(channelBtn) == 3'u,
+      "unexpected channel button: found=" & $(channelBtn != nil) &
+      (if channelBtn != nil: " class=" & windowClass(channelBtn) &
+        " face=" & $settingsFaceProp(channelBtn) else: "")
+    doAssert autoSwitch != nil and
+      windowClass(autoSwitch).toLowerAscii() == "button" and
+      buttonType(autoSwitch) == BS_AUTOCHECKBOX and
+      settingsFaceProp(autoSwitch) == 8'u,
+      "unexpected auto-download switch: found=" & $(autoSwitch != nil) &
+      (if autoSwitch != nil: " class=" & windowClass(autoSwitch) &
+        " buttonType=" & $buttonType(autoSwitch) &
+        " expectedType=" & $BS_AUTOCHECKBOX &
+        " face=" & $settingsFaceProp(autoSwitch) else: "")
     echo "Win32 bounded host safe-tick hook probe passed"

@@ -168,7 +168,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw '拾光图标资源构建失败' }
           nim c -d:release @defs --cc:gcc --app:gui --passL:build/shiguang-icon.o --path:leaf/src --nimcache:build/nimcache --out:build/shiguang.exe src/shiguang.nim
           if ($LASTEXITCODE -ne 0) { throw '拾光截图构建失败' }
-          nim c -d:release @defs --cc:gcc --app:gui --nimcache:build/helper-cache --out:build/shiguang-updater.exe src/updater_helper.nim
+          windres -I src -i src/shiguang-updater.rc -o build/shiguang-updater-icon.o
+          if ($LASTEXITCODE -ne 0) { throw '拾光更新助手图标资源构建失败' }
+          nim c -d:release @defs --cc:gcc --app:gui --passL:build/shiguang-updater-icon.o --nimcache:build/helper-cache --out:build/shiguang-updater.exe src/updater_helper.nim
           if ($LASTEXITCODE -ne 0) { throw '拾光更新助手构建失败' }
           $exe = Get-Item build/shiguang.exe -ErrorAction SilentlyContinue
           if (-not $exe -or $exe.Length -le 0) { throw 'build/shiguang.exe 缺失或为空' }

@@ -180,7 +180,7 @@ int canvas_render(Canvas *c, const Image *base, const History *h, const Mark *dr
 }
 
 static const WCHAR *const labels[] = {
-    L"形状", L"箭头", L"自由画笔", L"文字", L"颜色", L"撤销", L"重做", L"保存 PNG（Ctrl+S）", L"复制（Enter）"
+    L"形状", L"箭头", L"自由画笔", L"文字", L"颜色", L"撤销（Ctrl+Z）", L"重做", L"保存 PNG（Ctrl+S）", L"复制（Enter）"
 };
 static const WCHAR *const shape_labels[] = {L"矩形", L"圆", L"椭圆", L"三角形", L"菱形"};
 static const WCHAR *const color_labels[] = {L"红色", L"蓝色", L"绿色", L"黄色", L"深色", L"白色"};
@@ -268,7 +268,8 @@ static LRESULT CALLBACK panel_button_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp
     if (msg == WM_MOUSELEAVE) InvalidateRect(w, NULL, FALSE);
     if ((msg == WM_CHAR || msg == WM_SYSCHAR) && wp == 27) return 0;
     if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
-        (wp == VK_ESCAPE || wp == VK_RETURN || (wp == 'S' && GetKeyState(VK_CONTROL) < 0))) {
+        (wp == VK_ESCAPE || wp == VK_RETURN ||
+         ((wp == 'S' || wp == 'Z') && GetKeyState(VK_CONTROL) < 0))) {
         HWND overlay = GetAncestor(w, GA_ROOTOWNER);
         if (overlay && overlay != w) {
             SendMessageW(overlay, msg, wp, lp);

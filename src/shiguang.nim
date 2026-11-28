@@ -4,9 +4,9 @@ when not (defined(windows) and defined(amd64)):
 import leaf
 import leaf/ui as standard
 import leaf/ui_contract
-import std/[options, os]
+import std/[options, os, strutils]
 import settings_view, update_bridge
-import leaf/[native_layout, styles, ui_thread]
+import leaf/[native_layout, native_theme, styles, ui_thread]
 import leaf/backends/win32/[api, backend, calls, host]
 
 {.compile: "crop.c".}
@@ -18,10 +18,13 @@ import leaf/backends/win32/[api, backend, calls, host]
 {.passC: "-D_WIN32_WINNT=0x0a00 -include stddef.h".}
 {.passL: "-luser32 -lgdi32 -lmsimg32 -ldwmapi -lcomctl32 -lshell32 -ladvapi32 -lole32 -luuid -lwindowscodecs".}
 
-{.push cdecl, importc, header: "desktop_win.h".}
+const desktopWinHeader = block:
+  let p = currentSourcePath().replace('\\', '/')
+  p[0 .. p.rfind('/')] & "desktop_win.h"
+{.push cdecl, importc, header: desktopWinHeader.}
 proc sg_start(): cint
 proc sg_stop()
-proc sg_bind_settings(window: HWND): cint
+proc sg_bind_settings*(window: HWND): cint
 proc sg_ready(background: cint)
 proc sg_startup_state(): cint
 proc sg_set_startup(enable: cint): cint
@@ -37,6 +40,8 @@ proc sg_record_hotkey(recording: cint): cint {.discardable.}
 proc sg_settings_caption(action: cint)
 proc sg_style_settings()
 proc sg_settings_dark(): cint
+proc sg_is_select_popup_dc(dc: HDC): cint
+proc sg_settings_popup_color(slot: cint): uint32
 proc sg_exit()
 proc sg_fatal(message: cstring)
 {.pop.}
@@ -66,7 +71,7 @@ type SettingsState = object
   channelOpen: bool
   activeTab: SettingsTab
   dark: bool
-let Settings = defineComponent[tuple[], State[SettingsState]]("Settings",
+let Settings* = defineComponent[tuple[], State[SettingsState]]("Settings",
   proc(ctx: MountContext, props: tuple[]): State[SettingsState] =
     ctx.state(SettingsState(chord: sg_hotkey(), startup: sg_startup_state(),
       updates: updateSnapshot(), dark: sg_settings_dark() != 0)),
@@ -159,6 +164,66 @@ proc requestUpdateRestart*(): bool =
     sg_update_exit()
     return true
 
+proc attemptAutomaticUpdate*(): bool =
+  ## Runs once per timer turn. A verified, authorized install first stays visible and
+  ## cancellable for a few seconds, then restarts as soon as screenshots, annotation,
+  ## saving or hotkey recording ended. A posted cancel is dispatched before this turn
+  ## whenever it was posted earlier; the authorization is re-checked inside the gate,
+  ## and a failed helper keeps the verified stage for the manual action.
+  let snapshot = updateSnapshot()
+  if snapshot.phase != upReady or not snapshot.installReady: return false
+  if not autoInstallDue(): return false
+  if sg_update_can_restart() == 0: return false
+  if requestUpdateRestart(): return true
+  if updateSnapshot().result == rrInstallFailed:
+    sg_update_notice(newWideCString("自动更新未能启动，可稍后在设置或托盘手动重启更新。"))
+  false
+
+proc currentSelectPopupColors(): SelectPopupColors {.raises: [].} =
+  SelectPopupColors(
+    surface: sg_settings_popup_color(0),
+    active: sg_settings_popup_color(1),
+    border: sg_settings_popup_color(2),
+    ink: sg_settings_popup_color(3),
+    activeInk: sg_settings_popup_color(4),
+    muted: sg_settings_popup_color(5))
+
+proc installSelectPopupCalls*(calls: var Win32Calls) =
+  ## Leaf's select_host paints its owned LeafSelectPopup-* window using fixed shadcn
+  ## palette colors via calls.setDCBrushColor/setTextColor/setDCPenColor without a
+  ## high-contrast gate. Remap only that popup's DC calls to live settings_colors
+  ## (Windows system colors in High Contrast, Shiguang palette in Light/Dark) while
+  ## keeping Leaf's input, focus, selection, and UIA handling untouched.
+  let leafLight = palette(shadcnLight)
+  let leafDark = palette(shadcnDark)
+  let baseBrush = calls.setDCBrushColor
+  let baseText = calls.setTextColor
+  let basePen = calls.setDCPenColor
+  var state = SelectPopupRemap()
+  calls.setDCBrushColor = proc(dc: HDC, color: DWORD): DWORD =
+    if sg_is_select_popup_dc(dc) != 0:
+      let mapped = remapSelectBrush(state, uint32(color), leafLight, leafDark, currentSelectPopupColors())
+      return baseBrush(dc, DWORD(mapped))
+    baseBrush(dc, color)
+  calls.setTextColor = proc(dc: HDC, color: DWORD): DWORD =
+    if sg_is_select_popup_dc(dc) != 0:
+      let mapped = remapSelectInk(state, uint32(color), leafLight, leafDark, currentSelectPopupColors())
+      return baseText(dc, DWORD(mapped))
+    baseText(dc, color)
+  calls.setDCPenColor = proc(dc: HDC, color: DWORD): DWORD =
+    if sg_is_select_popup_dc(dc) != 0:
+      let mapped = remapSelectInk(state, uint32(color), leafLight, leafDark, currentSelectPopupColors())
+      return basePen(dc, DWORD(mapped))
+    basePen(dc, color)
+
+proc bindSettingsSafeTick*(window: Win32Host, native: Win32Backend, runtime: Runtime,
+                           sync: ptr SettingsStyleSync) =
+  window.setSafeTick(proc() =
+    runSettingsSafeTick(sync[],
+      proc() = native.safeListTurn(),
+      proc(): uint64 = runtime.acceptedRevision,
+      proc() {.raises: [].} = sg_style_settings()))
+
 proc runSettingsHost(background, confirming: bool): int =
   let application = app(Settings, title = settingsTitle, width = settingsWidth, height = settingsHeight)
     .withNativeTheme(shadcnLight) # The root theme provider selects the current Windows mode.
@@ -175,11 +240,15 @@ proc runSettingsHost(background, confirming: bool): int =
 
   var hostCalls = systemWin32Calls()
   var settingsError: ref Exception
+  var styleSync = SettingsStyleSync()
+  proc syncSettingsStyleNow(force = false) {.raises: [].} =
+    styleSync.syncSettingsStyle(runtime.acceptedRevision,
+      proc() {.raises: [].} = sg_style_settings(), force = force)
   proc applyUpdate(snapshot: UpdateSnapshot, feedback = none(UpdateFeedback)) =
     sg_update_set_available(cint(snapshot.phase == upReady))
     if updateState != nil:
       runtime.uiTask(proc() = updateState(snapshot, feedback))
-      sg_style_settings()
+      syncSettingsStyleNow(force = true)
 
   proc handleUpdateAction(action: UpdateAction; fromTray: bool) =
     let busy = action == uaRestart and sg_update_can_restart() == 0
@@ -192,6 +261,8 @@ proc runSettingsHost(background, confirming: bool): int =
         updateSnapshot().settings.autoDownload == desired or changeAutoDownload(desired)
       of uaDownload: downloadUpdate()
       of uaRestart: requestUpdateRestart()
+      of uaCheck: checkForUpdates()
+      of uaCancelAutoInstall: cancelUpdateAutoInstall()
     if action == uaRestart and accepted: return
     let feedback = updateActionFeedback(action, accepted, busy)
     applyUpdate(updateSnapshot(), some(feedback))
@@ -201,7 +272,7 @@ proc runSettingsHost(background, confirming: bool): int =
     let finish = recordKey
     try:
       runtime.uiTask(proc() = finish(chord))
-      sg_style_settings()
+      syncSettingsStyleNow(force = true)
     except Exception as error:
       settingsError = error
       sg_exit()
@@ -211,7 +282,7 @@ proc runSettingsHost(background, confirming: bool): int =
   hostCalls.dispatchMessage = proc(message: ptr MSG): LRESULT =
     let before = runtime.acceptedRevision
     result = dispatchMessage(message)
-    if runtime.acceptedRevision != before: sg_style_settings()
+    if runtime.acceptedRevision != before: syncSettingsStyleNow()
     sg_after_dispatch()
   var settingsWindow: HWND
   var confirmationTurn = 0
@@ -238,7 +309,9 @@ proc runSettingsHost(background, confirming: bool): int =
       if confirming and confirmationTurn < 2: return 1
       try:
         case message.wParam
-        of 0: tickUpdates()
+        of 0:
+          tickUpdates()
+          discard attemptAutomaticUpdate()
         of 1: handleUpdateAction(uaRestart, fromTray = true)
         else:
           if message.wParam in WPARAM(2)..WPARAM(2 + ord(high(UpdateAction))):
@@ -255,7 +328,7 @@ proc runSettingsHost(background, confirming: bool): int =
         try:
           let ready = message.wParam != 0
           runtime.uiTask(proc() = trayState(ready))
-          sg_style_settings()
+          syncSettingsStyleNow(force = true)
         except Exception as error:
           settingsError = error
           sg_exit()
@@ -264,17 +337,19 @@ proc runSettingsHost(background, confirming: bool): int =
       return 0
     let before = runtime.acceptedRevision
     result = dialogMessage(root, message)
-    if runtime.acceptedRevision != before: sg_style_settings()
+    if runtime.acceptedRevision != before: syncSettingsStyleNow()
   let window = createHost(application.title,
     DipSize(width: float64(application.width), height: float64(application.height)),
     calls = hostCalls, theme = application.nativeTheme)
   defer: window.destroyHost()
   window.setStartupScope(proc(): bool = activity.busy or runtime.installingUpdate or runtime.installingHook)
-  let native = newWin32Backend(window, renderer = application.canvasRenderer)
+  var backendCalls = systemWin32Calls()
+  installSelectPopupCalls(backendCalls)
+  let native = newWin32Backend(window, calls = backendCalls, renderer = application.canvasRenderer)
   let session = native.attachWin32Backend(runtime)
   native.bindSession(session)
   window.bindSession(session, proc(): bool = activity.busy)
-  window.setSafeTick(proc() = native.safeListTurn())
+  bindSettingsSafeTick(window, native, runtime, addr styleSync)
   if sg_bind_settings(window.windowHandle()) == 0:
     raise newException(OSError, "无法绑定设置窗口。")
   settingsWindow = window.windowHandle()

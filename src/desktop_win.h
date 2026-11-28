@@ -13,6 +13,8 @@ int sg_bind_settings(HWND window);
 void sg_settings_caption(int close);
 void sg_style_settings(void);
 int sg_settings_dark(void);
+int sg_is_select_popup_dc(HDC dc);
+uint32_t sg_settings_popup_color(int slot);
 void sg_ready(int background);
 void sg_update_set_available(int available);
 void sg_update_notice(const wchar_t *message);

@@ -36,7 +36,8 @@ func stableVersion*(tag: string): Option[array[3, uint64]] =
       version[i] = version[i] * 10 + uint64(ord(c) - ord('0'))
   some(version)
 
-func stableUpdateAllowed(current, candidate: string): bool =
+func stableUpdateAllowed*(current, candidate: string): bool =
+  ## Shared by routing diagnostics and `accepts`; never authorizes a package.
   let a = stableVersion(current)
   let b = stableVersion(candidate)
   if a.isNone or b.isNone: return false

@@ -125,7 +125,10 @@ static BOOL record_save_guard(void) {
     return last_guard_allowed;
 }
 
+static unsigned save_dialog_calls;
+
 static HRESULT test_save_dialog(HWND w, const Image *image, SaveAllowed allowed) {
+    ++save_dialog_calls;
     if (!picked_path) return save_result;
     if (invalidate_in_picker) {
         SendMessageW(invalidate_in_picker, WM_DISPLAYCHANGE, 0, 0);
@@ -572,6 +575,8 @@ static void theme_test(void) {
     const UiPalette light = ui_palette(FALSE, FALSE), dark = ui_palette(TRUE, FALSE);
     const UiPalette hc_light = ui_palette(FALSE, TRUE), hc_dark = ui_palette(TRUE, TRUE);
     assert(light.surface == RGB(255, 255, 255) && dark.surface == RGB(28, 33, 43));
+    assert(light.card_edge == RGB(229, 234, 241) && light.edge == RGB(203, 213, 225));
+    assert(dark.sidebar == RGB(21, 25, 33) && dark.card == RGB(36, 43, 56));
     assert(light.sidebar != light.surface && dark.sidebar != dark.surface);
     assert(light.surface != dark.surface && light.ink != dark.ink);
     assert(light.accent == dark.accent && light.active != dark.active);
@@ -852,6 +857,146 @@ static void adjustment_test(void) {
     assert(phase == IDLE && recent.bgra == previous_recent && copies == previous_copies);
 }
 
+// Modifiers are written to this thread's key state only: no synthetic input, no
+// system or global-hotkey change, and the original state is restored once.
+static unsigned char keyboard_state_backup[256];
+static BOOL keyboard_state_saved;
+
+static void set_modifiers(BOOL ctrl, BOOL shift) {
+    unsigned char keys[256] = {0}; // A bare key must be exactly bare.
+    if (!keyboard_state_saved) {
+        assert(GetKeyboardState(keyboard_state_backup));
+        keyboard_state_saved = TRUE;
+    }
+    keys[VK_CONTROL] = keys[VK_LCONTROL] = ctrl ? 0x80 : 0;
+    keys[VK_SHIFT] = keys[VK_LSHIFT] = shift ? 0x80 : 0;
+    assert(SetKeyboardState(keys));
+}
+
+static void undo_shortcut_test(void) {
+    release_into_editor();
+    HWND w = surfaces[0].window;
+    HWND undo = toolbar.buttons[ACT_UNDO], redo = toolbar.buttons[ACT_REDO];
+    size_t bytes = image_bytes(base.width, base.height);
+    assert(phase == EDITING && !history.used && !IsWindowEnabled(undo) && !IsWindowEnabled(redo));
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 0);
+    set_modifiers(FALSE, FALSE);
+    assert(phase == EDITING && !history.used && !IsWindowEnabled(undo) && !IsWindowEnabled(redo));
+
+    // Two committed marks make both dispatch paths provable.
+    Mark pen = {.tool = PEN, .color = palette[0], .width = 3};
+    Mark box = {.tool = RECTANGLE, .color = palette[1], .width = 3,
+                .x = 40, .y = 12, .end_x = 62, .end_y = 30};
+    assert(mark_point(&pen, 10, 10) && history_add(&history, &pen) && history_add(&history, &box));
+    edit_changed();
+    sync_tools();
+    assert(history.used == 2 && IsWindowEnabled(undo) && !IsWindowEnabled(redo));
+    assert(flush_overlays() && memcmp(canvas.image.bgra, base.bgra, bytes));
+
+    // Bare Z, auto-repeat and a second modifier stay inert on a live history.
+    set_modifiers(FALSE, FALSE);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 0);
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 1L << 30);
+    set_modifiers(TRUE, TRUE);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 0);
+    set_modifiers(FALSE, FALSE);
+    assert(history.used == 2 && IsWindowEnabled(undo) && !IsWindowEnabled(redo));
+
+    // The canvas chord undoes exactly the last mark.
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 0);
+    set_modifiers(FALSE, FALSE);
+    assert(phase == EDITING && history.used == 1 && history.total == 2);
+    assert(IsWindowEnabled(undo) && IsWindowEnabled(redo));
+
+    // A focused toolbar button forwards the same chord; SendMessage proves the
+    // routing, not a real focus. Now both marks are undone and the render is back
+    // to the frozen crop.
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(toolbar.buttons[ACT_PEN], WM_KEYDOWN, 'Z', 0);
+    set_modifiers(FALSE, FALSE);
+    assert(phase == EDITING && !history.used && history.total == 2);
+    assert(!IsWindowEnabled(undo) && IsWindowEnabled(redo));
+    assert(flush_overlays() && !memcmp(canvas.image.bgra, base.bgra, bytes));
+
+    // The protection checks need a mark that the shortcut could really undo.
+    Mark again = {.tool = RECTANGLE, .color = palette[0], .width = 3,
+                  .x = 8, .y = 8, .end_x = 30, .end_y = 26};
+    assert(history_add(&history, &again));
+    edit_changed();
+    sync_tools();
+    assert(history.used == 1 && IsWindowEnabled(undo));
+
+    // Text entry keeps the canvas history and the field, IME composition included.
+    tool = TEXT;
+    start_mark(w, (POINT){selection.left + 12, selection.top + 16});
+    HWND field = text_input;
+    WCHAR kept[16];
+    assert(field && SetWindowTextW(field, L"保留输入"));
+
+    // Plain text plus a non-empty history, before any composition: the canvas chord
+    // must leave the field, its content and the history alone.
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 0);
+    set_modifiers(FALSE, FALSE);
+    assert(text_input == field && history.used == 1 && IsWindowEnabled(undo));
+    assert(GetWindowTextW(field, kept, ARRAYSIZE(kept)) == 4);
+
+    SendMessageW(field, WM_IME_STARTCOMPOSITION, 0, 0);
+    assert(ime_composing);
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(field, WM_KEYDOWN, 'Z', 0);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 0);
+    set_modifiers(FALSE, FALSE);
+    SendMessageW(field, WM_IME_ENDCOMPOSITION, 0, 0);
+    assert(!ime_composing && phase == EDITING && text_input == field);
+    assert(history.used == 1 && IsWindowEnabled(undo));
+    assert(GetWindowTextW(field, kept, ARRAYSIZE(kept)) == 4 && !wcscmp(kept, L"保留输入"));
+    assert(SetWindowTextW(field, L"") && !GetWindowTextLengthW(field));
+    assert(commit_text() && !text_input && history.used == 1);
+
+    // A live drag keeps both the draft and the history.
+    tool = PEN;
+    start_mark(w, (POINT){selection.left + 20, selection.top + 20});
+    Mark staged = draft;
+    assert(drawing && GetCapture() == w);
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 0);
+    set_modifiers(FALSE, FALSE);
+    assert(drawing && history.used == 1 && !memcmp(&draft, &staged, sizeof staged));
+    discard_draft();
+    assert(ReleaseCapture() && !drawing && !GetCapture());
+
+    // Resizing the selection keeps its latched rectangle and the history.
+    assert(start_adjustment(w, SEL_MOVE, (POINT){selection.left + 30, selection.top + 24}));
+    Rect staged_area = adjust_area, staged_selection = selection;
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(w, WM_KEYDOWN, 'Z', 0);
+    set_modifiers(FALSE, FALSE);
+    assert(adjust_mode == SEL_MOVE && same_rect(adjust_area, staged_area));
+    assert(same_rect(selection, staged_selection) && history.used == 1);
+    SendMessageW(w, WM_CANCELMODE, 0, 0);
+    assert(!adjust_mode && !GetCapture() && history.used == 1);
+
+    // Ctrl+S on a focused button still reaches the save dialog exactly once, and a
+    // cancelled save keeps the edit, the history and the buttons.
+    unsigned saves = save_dialog_calls;
+    save_result = S_FALSE;
+    set_modifiers(TRUE, FALSE);
+    SendMessageW(toolbar.buttons[ACT_SAVE], WM_KEYDOWN, 'S', 0);
+    set_modifiers(FALSE, FALSE);
+    save_result = S_OK;
+    assert(save_dialog_calls == saves + 1);
+    assert(phase == EDITING && IsWindowVisible(toolbar.window) && history.used == 1 && IsWindowEnabled(undo));
+
+    assert(SetKeyboardState(keyboard_state_backup));
+    keyboard_state_saved = FALSE;
+    SendMessageW(w, WM_KEYDOWN, VK_ESCAPE, 0);
+    assert(phase == IDLE && !history.used);
+}
+
 static void narrow_edit_test(void) {
     release_into_editor();
     HWND w = surfaces[0].window;
@@ -961,6 +1106,7 @@ static void edit_test(void) {
     save_result = S_OK;
     editor_action(ACT_SAVE);
     assert(phase == IDLE && recent.bgra && recent.width == 70 && copies == 2);
+    undo_shortcut_test();
 }
 
 static void assert_no_target(void) {
@@ -1025,9 +1171,192 @@ static void save_editor_test(void) {
     picked_path = NULL;
 }
 
+static COLORREF sample_rendered_pixel(HWND control, int x, int y) {
+    HDC probe = CreateCompatibleDC(NULL);
+    RECT bounds;
+    assert(probe && GetClientRect(control, &bounds) && bounds.right > x && bounds.bottom > y);
+    BITMAPINFO info = bitmap_info(bounds.right, bounds.bottom);
+    void *bits = NULL;
+    HBITMAP dib = CreateDIBSection(probe, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    assert(dib);
+    HGDIOBJ previous = SelectObject(probe, dib);
+    SendMessageW(control, WM_PRINTCLIENT, (WPARAM)probe, PRF_CLIENT);
+    COLORREF actual = GetPixel(probe, x, y);
+    SelectObject(probe, previous);
+    DeleteObject(dib);
+    DeleteDC(probe);
+    return actual;
+}
+
+static void assert_rendered_pixel(HWND control, int x, int y, COLORREF expected) {
+    assert(sample_rendered_pixel(control, x, y) == expected);
+}
+
+static void settings_nested_style_test(void) {
+    const WNDCLASSW cls = {.lpfnWndProc = DefWindowProcW, .hInstance = instance,
+                           .lpszClassName = L"Shiguang.Test.SettingsNested"};
+    assert(RegisterClassW(&cls));
+    HWND window = CreateWindowExW(0, cls.lpszClassName, APP_TITLE, WS_OVERLAPPEDWINDOW,
+        0, 0, 680, 424, NULL, NULL, instance, NULL);
+    assert(window && sg_bind_settings(window));
+    int dpi = (int)GetDpiForWindow(window);
+    if (!dpi) dpi = 96;
+
+    // Mirror Leaf's nested STATIC/BUTTON tree: theme -> settings -> sidebar + main -> body -> card -> row -> controls.
+    HWND theme = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0, 0, MulDiv(680, dpi, 96), MulDiv(424, dpi, 96), window, NULL, instance, NULL);
+    HWND root = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0, 0, MulDiv(680, dpi, 96), MulDiv(424, dpi, 96), theme, NULL, instance, NULL);
+    HWND sidebar = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0, 0, MulDiv(180, dpi, 96), MulDiv(424, dpi, 96), root, NULL, instance, NULL);
+    HWND brand = CreateWindowExW(0, L"STATIC", L"拾光截图", WS_CHILD | WS_VISIBLE,
+        14, 14, MulDiv(152, dpi, 96), MulDiv(42, dpi, 96), sidebar, NULL, instance, NULL);
+    HWND nav_box = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        14, 64, MulDiv(152, dpi, 96), MulDiv(76, dpi, 96), sidebar, NULL, instance, NULL);
+    HWND nav_general = CreateWindowExW(0, L"BUTTON", L"常规", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0, 0, MulDiv(152, dpi, 96), MulDiv(34, dpi, 96), nav_box, NULL, instance, NULL);
+    HWND nav_update = CreateWindowExW(0, L"BUTTON", L"软件更新", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0, MulDiv(38, dpi, 96), MulDiv(152, dpi, 96), MulDiv(34, dpi, 96), nav_box, NULL, instance, NULL);
+    HWND quit = CreateWindowExW(0, L"BUTTON", L"退出拾光", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        14, MulDiv(370, dpi, 96), MulDiv(152, dpi, 96), MulDiv(34, dpi, 96), sidebar, NULL, instance, NULL);
+    HWND body = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        MulDiv(180, dpi, 96), MulDiv(36, dpi, 96), MulDiv(500, dpi, 96), MulDiv(388, dpi, 96),
+        root, NULL, instance, NULL);
+
+    HWND general_card = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        20, 60, MulDiv(460, dpi, 96), MulDiv(180, dpi, 96), body, NULL, instance, NULL);
+    assert(SetPropW(general_card, leaf_ui_role_key, (HANDLE)(uintptr_t)LEAF_ROLE_CARD));
+    HWND shortcut_row = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        16, 56, MulDiv(428, dpi, 96), MulDiv(34, dpi, 96), general_card, NULL, instance, NULL);
+    HWND change = CreateWindowExW(0, L"BUTTON", L"更改", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        MulDiv(340, dpi, 96), 0, MulDiv(88, dpi, 96), MulDiv(34, dpi, 96), shortcut_row, NULL, instance, NULL);
+    HWND startup_row = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        16, 112, MulDiv(428, dpi, 96), MulDiv(40, dpi, 96), general_card, NULL, instance, NULL);
+    HWND startup = CreateWindowExW(0, L"BUTTON", L"登录 Windows 时启动拾光",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        MulDiv(384, dpi, 96), MulDiv(6, dpi, 96), MulDiv(44, dpi, 96), MulDiv(28, dpi, 96),
+        startup_row, NULL, instance, NULL);
+    assert(brand && nav_general && nav_update && quit && change && startup);
+
+    const SettingsPalette saved_palette = settings_colors;
+    const BOOL saved_ready = settings_colors_ready;
+    settings_colors = settings_palette(FALSE, FALSE);
+    settings_colors_ready = TRUE;
+    sg_style_settings();
+    assert((DWORD_PTR)GetPropW(nav_general, settings_face_key) == SETTINGS_NAV_ACTIVE);
+    assert((DWORD_PTR)GetPropW(nav_update, settings_face_key) == SETTINGS_NAV_IDLE);
+    assert((DWORD_PTR)GetPropW(change, settings_face_key) == SETTINGS_SECONDARY_BTN);
+    assert((DWORD_PTR)GetPropW(startup, settings_face_key) == SETTINGS_SWITCH);
+    assert((uintptr_t)GetPropW(general_card, settings_bg_key) == BG_CARD);
+    assert(SetWindowTextW(change, L"取消录入"));
+    assert_rendered_pixel(change, MulDiv(6, dpi, 96), MulDiv(6, dpi, 96), settings_colors.surface);
+
+    // Simulate switching to the Software Update tab: destroy General card, mount Update controls.
+    assert(DestroyWindow(general_card));
+    HWND upd_title = CreateWindowExW(0, L"STATIC", L"软件更新", WS_CHILD | WS_VISIBLE,
+        20, 20, MulDiv(104, dpi, 96), MulDiv(26, dpi, 96), body, NULL, instance, NULL);
+    HWND upd_ver = CreateWindowExW(0, L"STATIC", L"当前版本 dev-7fd455b1a2b3 测试版", WS_CHILD | WS_VISIBLE,
+        MulDiv(136, dpi, 96), 24, MulDiv(344, dpi, 96), MulDiv(20, dpi, 96), body, NULL, instance, NULL);
+    HWND upd_card = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        20, 60, MulDiv(460, dpi, 96), MulDiv(132, dpi, 96), body, NULL, instance, NULL);
+    assert(SetPropW(upd_card, leaf_ui_role_key, (HANDLE)(uintptr_t)LEAF_ROLE_CARD));
+    HWND ch_row = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        16, 16, MulDiv(428, dpi, 96), MulDiv(36, dpi, 96), upd_card, NULL, instance, NULL);
+    HWND ch_wrap = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        MulDiv(280, dpi, 96), 0, MulDiv(148, dpi, 96), MulDiv(36, dpi, 96), ch_row, NULL, instance, NULL);
+    HWND channel = CreateWindowExW(0, L"BUTTON", L"测试版", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0, 0, MulDiv(148, dpi, 96), MulDiv(36, dpi, 96), ch_wrap, NULL, instance, NULL);
+    assert(SetPropW(channel, leaf_ui_role_key, (HANDLE)(uintptr_t)LEAF_ROLE_SELECT_TRIGGER));
+    HWND auto_dl = CreateWindowExW(0, L"BUTTON", L"自动下载更新",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        MulDiv(384, dpi, 96), MulDiv(80, dpi, 96), MulDiv(44, dpi, 96), MulDiv(28, dpi, 96),
+        upd_card, NULL, instance, NULL);
+    HWND banner = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        20, 204, MulDiv(460, dpi, 96), MulDiv(74, dpi, 96), body, NULL, instance, NULL);
+    assert(SetPropW(banner, leaf_ui_role_key, (HANDLE)(uintptr_t)LEAF_ROLE_CARD));
+    HWND ready_lbl = CreateWindowExW(0, L"STATIC", L"新版本已就绪", WS_CHILD | WS_VISIBLE,
+        16, 16, MulDiv(240, dpi, 96), MulDiv(22, dpi, 96), banner, NULL, instance, NULL);
+    HWND restart = CreateWindowExW(0, L"BUTTON", L"重启更新", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        MulDiv(340, dpi, 96), 16, MulDiv(104, dpi, 96), MulDiv(36, dpi, 96), banner, NULL, instance, NULL);
+    assert(upd_title && upd_ver && channel && auto_dl && ready_lbl && restart);
+
+    SendMessageW(auto_dl, BM_SETCHECK, BST_CHECKED, 0);
+    sg_style_settings();
+    assert((DWORD_PTR)GetPropW(nav_general, settings_face_key) == SETTINGS_NAV_IDLE);
+    assert((DWORD_PTR)GetPropW(nav_update, settings_face_key) == SETTINGS_NAV_ACTIVE);
+    assert((DWORD_PTR)GetPropW(channel, settings_face_key) == SETTINGS_SELECT_TRIGGER);
+    assert((DWORD_PTR)GetPropW(auto_dl, settings_face_key) == SETTINGS_SWITCH);
+    assert((DWORD_PTR)GetPropW(restart, settings_face_key) == SETTINGS_ACCENT_BTN);
+    assert((uintptr_t)GetPropW(banner, settings_bg_key) == BG_BANNER);
+
+    // Styled select trigger (including dropdown chevron), switch pill, ready banner, accent CTA, and focus ring.
+    assert_rendered_pixel(channel, MulDiv(6, dpi, 96), MulDiv(6, dpi, 96), settings_colors.surface);
+    {
+        HDC probe = CreateCompatibleDC(NULL);
+        RECT cb;
+        assert(probe && GetClientRect(channel, &cb));
+        BITMAPINFO cinfo = bitmap_info(cb.right, cb.bottom);
+        void *cbits = NULL;
+        HBITMAP cdib = CreateDIBSection(probe, &cinfo, DIB_RGB_COLORS, &cbits, NULL, 0);
+        assert(cdib);
+        HGDIOBJ cprev = SelectObject(probe, cdib);
+        SendMessageW(channel, WM_PRINTCLIENT, (WPARAM)probe, PRF_CLIENT);
+        int chevron_ink = 0;
+        int x0 = cb.right - MulDiv(24, dpi, 96), x1 = cb.right - MulDiv(8, dpi, 96);
+        int y0 = cb.bottom / 2 - MulDiv(6, dpi, 96), y1 = cb.bottom / 2 + MulDiv(6, dpi, 96);
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                if (GetPixel(probe, x, y) != settings_colors.surface) ++chevron_ink;
+        assert(chevron_ink > 0 && "select trigger must paint its dropdown chevron");
+        SelectObject(probe, cprev);
+        DeleteObject(cdib);
+        DeleteDC(probe);
+    }
+    assert_rendered_pixel(auto_dl, MulDiv(44, dpi, 96) - MulDiv(28, dpi, 96), MulDiv(14, dpi, 96), settings_colors.accent);
+    assert_rendered_pixel(banner, MulDiv(10, dpi, 96), MulDiv(10, dpi, 96), settings_colors.banner);
+    assert_rendered_pixel(restart, MulDiv(10, dpi, 96), MulDiv(10, dpi, 96), settings_colors.accent);
+
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    SetActiveWindow(window);
+    SendMessageW(window, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
+    SetFocus(nav_general);
+    assert(GetFocus() == nav_general);
+    assert(!(SendMessageW(nav_general, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS));
+    // Focus ring must draw on the 1px inset border without filling the idle tab as selected.
+    // Do not move the user's cursor: unselected nav paints hover if the live cursor happens to
+    // rest over it (desktop_win.c: hot && !hc ? c->hover : bg), never the selected active fill.
+    // Selected nav in non-HC ignores hover and only leaves active when BST_PUSHED is set.
+    RECT nav_rect;
+    assert(GetClientRect(nav_general, &nav_rect));
+    assert_rendered_pixel(nav_general, (nav_rect.left + nav_rect.right) / 2, 1, settings_colors.focus);
+    assert(settings_colors.sidebar != settings_colors.active &&
+           settings_colors.hover != settings_colors.active);
+    COLORREF general_fill = sample_rendered_pixel(nav_general, MulDiv(6, dpi, 96), MulDiv(6, dpi, 96));
+    assert(general_fill != settings_colors.active);
+    assert(general_fill == settings_colors.sidebar || general_fill == settings_colors.hover);
+    assert(!(SendMessageW(nav_update, BM_GETSTATE, 0, 0) & BST_PUSHED));
+    COLORREF update_fill = sample_rendered_pixel(nav_update, MulDiv(6, dpi, 96), MulDiv(6, dpi, 96));
+    assert(update_fill == settings_colors.active && update_fill != general_fill);
+
+    // High Contrast popup colors must come from Windows system colors.
+    settings_colors = settings_palette(FALSE, TRUE);
+    assert(sg_settings_popup_color(0) == GetSysColor(COLOR_WINDOW));
+    assert(sg_settings_popup_color(1) == GetSysColor(COLOR_HIGHLIGHT));
+    assert(sg_settings_popup_color(2) == GetSysColor(COLOR_WINDOWTEXT));
+    assert(sg_settings_popup_color(3) == GetSysColor(COLOR_WINDOWTEXT));
+    assert(sg_settings_popup_color(4) == GetSysColor(COLOR_HIGHLIGHTTEXT));
+    assert(sg_settings_popup_color(5) == GetSysColor(COLOR_GRAYTEXT));
+
+    settings_colors = saved_palette;
+    settings_colors_ready = saved_ready;
+    assert(DestroyWindow(window));
+}
+
 static void settings_caption_test(void) {
-    // The same icon group must be usable by Explorer and by the window/tray loader.
+    // The same icon group must be usable by Explorer and by the window/tray loader,
+    // and the embedded manifest must enable ComCtl32 v6 custom draw.
     assert(FindResourceW(instance, MAKEINTRESOURCEW(IDI_SHIGUANG), RT_GROUP_ICON));
+    assert(FindResourceW(instance, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24)));
     small_icon = load_app_icon(SM_CXSMICON);
     large_icon = load_app_icon(SM_CXICON);
     assert(small_icon && large_icon);
@@ -1091,7 +1420,7 @@ static void settings_caption_test(void) {
     HGDIOBJ previous = SelectObject(probe, dib);
     SendMessageW(toggle, WM_PRINTCLIENT, (WPARAM)probe, PRF_CLIENT);
     COLORREF track = GetPixel(probe, bounds.right - MulDiv(28, dpi, 96), bounds.bottom / 2);
-    assert(track == ui_colors.accent);
+    assert(track == settings_colors.accent);
     SelectObject(probe, previous);
     DeleteObject(dib);
     DeleteDC(probe);
@@ -1130,6 +1459,7 @@ static void settings_caption_test(void) {
     assert(IsWindowVisible(window) && GetWindowRect(window, &after) && EqualRect(&moved, &after));
     tray_ready = FALSE;
     assert(DestroyWindow(window));
+    settings_nested_style_test();
 }
 
 static void startup_test(void) {

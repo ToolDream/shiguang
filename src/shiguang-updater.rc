@@ -1,0 +1,2 @@
+#include "shiguang_icon.h"
+IDI_SHIGUANG ICON "shiguang.ico"

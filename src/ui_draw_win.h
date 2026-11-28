@@ -16,7 +16,7 @@ typedef struct {
 
 static inline BOOL ui_ssaa_begin(UiSsaaSurface *s, HDC ref, int w, int h, COLORREF bg) {
     *s = (UiSsaaSurface){0};
-    if (w <= 0 || h <= 0 || w > 1024 || h > 1024) return FALSE;
+    if (w <= 0 || h <= 0 || w > 1600 || h > 1600) return FALSE;
     int sw = w * 4, sh = h * 4;
     BITMAPINFO info = {.bmiHeader = {
         .biSize = sizeof(BITMAPINFOHEADER), .biWidth = sw, .biHeight = -sh,
@@ -157,11 +157,11 @@ static inline void ui_aa_circle(HDC dc, RECT r, COLORREF bg, COLORREF fill,
 }
 
 static inline void ui_aa_switch(HDC dc, RECT r, COLORREF bg, BOOL on, BOOL disabled,
-                                const UiPalette *c, int dpi) {
+                                const SettingsPalette *c, int dpi) {
     int w = r.right - r.left, h = r.bottom - r.top;
     if (w <= 0 || h <= 0) return;
-    int track_h = MulDiv(22, dpi, 96);
-    int track_w = MulDiv(40, dpi, 96);
+    int track_h = MulDiv(23, dpi, 96);
+    int track_w = MulDiv(42, dpi, 96);
     if (track_w > w) track_w = w;
     if (track_h > h) track_h = h;
     int ox = w - track_w;
@@ -204,6 +204,36 @@ static inline void ui_aa_switch(HDC dc, RECT r, COLORREF bg, BOOL on, BOOL disab
     SetDCPenColor(s.dc, thumb_fill);
     Ellipse(s.dc, dx, dy, dx + dot, dy + dot);
     if (old_brush) SelectObject(s.dc, old_brush);
+    ui_ssaa_present(&s, dc, r.left, r.top);
+}
+
+static inline void ui_aa_chevron_down(HDC dc, RECT r, COLORREF bg, COLORREF ink, int dpi) {
+    int w = r.right - r.left, h = r.bottom - r.top;
+    if (w <= 0 || h <= 0) return;
+    UiSsaaSurface s;
+    if (!ui_ssaa_begin(&s, dc, w, h, bg)) {
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SetDCPenColor(dc, ink);
+        int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+        int half = MulDiv(4, dpi, 96), drop = MulDiv(2, dpi, 96);
+        MoveToEx(dc, cx - half, cy - drop, NULL);
+        LineTo(dc, cx, cy + drop);
+        LineTo(dc, cx + half, cy - drop);
+        return;
+    }
+    int cx = w * 2, cy = h * 2;
+    int half = MulDiv(4, dpi, 96) * 4;
+    int drop = MulDiv(2, dpi, 96) * 4;
+    int pw = MulDiv(6, dpi, 96);
+    if (pw < 5) pw = 5;
+    LOGBRUSH lb = {BS_SOLID, ink, 0};
+    HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, pw, &lb, 0, NULL);
+    HGDIOBJ old_pen = pen ? SelectObject(s.dc, pen) : NULL;
+    MoveToEx(s.dc, cx - half, cy - drop, NULL);
+    LineTo(s.dc, cx, cy + drop);
+    LineTo(s.dc, cx + half, cy - drop);
+    if (old_pen) SelectObject(s.dc, old_pen);
+    if (pen) DeleteObject(pen);
     ui_ssaa_present(&s, dc, r.left, r.top);
 }
 

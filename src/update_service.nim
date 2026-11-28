@@ -82,6 +82,21 @@ proc signedRelease(key: string; entry: JsonNode): Option[Release] =
     except ValueError:
       return none(Release)
 
+proc routed(entry: JsonNode; installed: UpdateBuild; channel: UpdateChannel): bool =
+  ## Release-level routing checks that precede signature verification. Used only to
+  ## tell "nothing newer" apart from "the qualifying release failed verification".
+  if entry.kind != JObject or entry{"draft"}.getBool(true): return false
+  let tag = entry{"tag_name"}.getStr()
+  let prerelease = entry{"prerelease"}.getBool()
+  let assets = entry{"assets"}
+  if assets.isNil or assets.kind != JArray: return false
+  var present = false
+  for asset in assets: present = present or asset{"name"}.getStr() == UpdateZip
+  if not present: return false
+  if prerelease: return channel == ucTest and tag == DevTag
+  if stableVersion(tag).isNone: return false
+  installed.channel != ucStable or stableUpdateAllowed(installed.version, tag)
+
 proc discover(input: WorkerInput; deadline: MonoTime): Option[Release] =
   let listing = parseJson(checkedGet(input.fetch, Api & "?per_page=" & $ListingPage,
     ListingLimit, deadline))
@@ -93,27 +108,25 @@ proc discover(input: WorkerInput; deadline: MonoTime): Option[Release] =
   var releases: seq[Release]
   var builds: seq[UpdateBuild]
   var hasStable, hasTest = false
-  for entry in listing:
+  var refused = ""     # a routed release whose signed manifest was refused
+  proc absorb(entry: JsonNode) =
     let release = signedRelease(input.key, entry)
     if release.isSome:
       releases.add(release.get)
       builds.add(release.get.manifest.build)
       hasStable = hasStable or release.get.manifest.build.channel == ucStable
       hasTest = hasTest or release.get.manifest.build.channel == ucTest
+    elif routed(entry, input.installed, input.job.channel):
+      refused = entry{"tag_name"}.getStr()
+  for entry in listing: absorb(entry)
   if maybeTruncated and not hasStable:
-    let listing = checkedGet(input.fetch, Api & "/latest", ListingLimit, deadline)
-    if listing != "":          # WinHTTP uses empty body for API 404 (no formal release).
-      let release = signedRelease(input.key, parseJson(listing))
-      if release.isSome:
-        releases.add(release.get)
-        builds.add(release.get.manifest.build)
+    let latest = checkedGet(input.fetch, Api & "/latest", ListingLimit, deadline)
+    if latest != "":       # WinHTTP uses empty body for API 404 (no formal release).
+      absorb(parseJson(latest))
   if maybeTruncated and input.job.channel == ucTest and not hasTest:
     let item = checkedGet(input.fetch, Api & "/tags/" & DevTag, ListingLimit, deadline)
     if item != "":
-      let release = signedRelease(input.key, parseJson(item))
-      if release.isSome and release.get.manifest.build.channel == ucTest:
-        releases.add(release.get)
-        builds.add(release.get.manifest.build)
+      absorb(parseJson(item))
   let choice = selectUpdate(input.installed, input.job.channel, builds)
   if choice.isSome:
     for release in releases:
@@ -121,6 +134,12 @@ proc discover(input: WorkerInput; deadline: MonoTime): Option[Release] =
         if result.isSome and result.get.body != release.body:
           raise newException(ValueError, "conflicting signed payloads for update build")
         result = some(release)
+    return
+  if refused.len != 0:
+    # Signature, manifest or inventory proof failed for a release that routes to this
+    # channel: that is an incomplete check, never "already up to date".
+    raise newException(ValueError,
+      "a qualifying update release failed signature or manifest verification")
 
 proc workerTurn(m: ptr WorkerMailbox) {.thread.} =
   let input = m.input.recv()
@@ -257,8 +276,42 @@ proc download*(s: UpdateService): bool =
   s.launch(job.get)
   true
 
+proc checkNow*(s: UpdateService; now: int64): bool =
+  ## One explicit "check and install" round from the settings action. Returns
+  ## whether the round accepted the click — a click merged into a running check or
+  ## queued behind a transfer is accepted without creating a second worker, so the
+  ## UI must not report it as an unavailable check.
+  if s.closed: return false
+  try:
+    let request = s.policy.requestCheck(now)
+    if request.job.isSome: s.launch(request.job.get)
+    request.accepted
+  except CatchableError as error:
+    s.policy.checkPersistenceFailed(error.msg)
+    false
+
+proc cancelAutoInstall*(s: UpdateService): bool =
+  ## Drops the one-shot authorization; a transfer in flight is left running.
+  not s.closed and s.policy.cancelAutoInstall()
+
+proc installArmed*(s: UpdateService): bool =
+  s != nil and not s.closed and s.snapshot.autoInstall
+
+proc installDue*(s: UpdateService; monotonicSeconds: int64): bool =
+  ## Once per timer turn: opens/advances the visible cancel window for this round.
+  ## A ready phase without the verified stage of its candidate is never installable.
+  if s.closed or s.snapshot.phase != upReady or not s.snapshot.installReady: return false
+  if s.staged.isNone or s.snapshot.candidate.isNone or
+      s.staged.get.build != s.snapshot.candidate.get:
+    discard s.policy.cancelAutoInstall()
+    return false
+  s.policy.installDue(monotonicSeconds)
+
 proc beginRestart*(s: UpdateService; safeToExit: bool): Option[StagedUpdate] =
-  if not s.closed and s.staged.isSome and s.policy.requestRestart(safeToExit):
+  if s.closed or s.staged.isNone: return
+  let stage = s.staged.get
+  # The automatic path may only install the stage of the candidate this round verified.
+  if s.policy.requestRestart(safeToExit, some(stage.build)):
     return s.staged
 
 proc restartFailed*(s: UpdateService; error: string) =

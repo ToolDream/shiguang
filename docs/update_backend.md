@@ -13,13 +13,24 @@
   返回是否已保存改动。切换不会立即发网络请求。
 - `changeAutoDownload(enabled: bool): bool`：返回是否已保存改动。
 - `downloadUpdate(): bool`：在 `upAvailable` 或 `upDownloadFailed` 可调用，返回是否受理。
+- `checkForUpdates(): bool`：「检查并安装更新」入口。只跳过 24 小时窗口，仍记录 `lastCheck`；
+  已有检查在进行时合并为该次检查，已有传输在进行时排队一次复查，不打开平行任务。
+- `autoInstallDue(): bool`：只在定时器回合调用，负责推进可见的取消窗口
+  （`CancelWindowSeconds`）并回答本次授权是否已可自动重启。
+- `cancelUpdateAutoInstall(): bool`：撤销本次「检查并安装」的一次性授权。正在进行的传输不打断，
+  已验证的暂存仍可通过手动「重启更新」使用。
+- `autoInstallArmed(): bool`：本次检查是否已下载验证完成并在等待空闲自动重启。
 - **重启按钮**使用 `src/shiguang.nim` 的 `requestUpdateRestart(): bool`。它检查截图、编辑、
   输出及快捷键录入是否空闲，仅在成功启动助手后结束应用。不要调用桥接层内部的 `restartForUpdate` 绕过这一入口。
 
 `UpdatePhase` 包含 `upIdle`、`upChecking`、`upCheckFailed`、`upAvailable`、
 `upDownloading`、`upDownloadFailed`、`upReady`、`upRestarting`。
 版本显示使用 `installed.version`，必要时用真实 `installed.revision` 补充，不能写设计稿版本。
-没有手动检查入口。托盘只在 `upReady` 显示「重启更新」。
+`UpdateSnapshot.autoInstall` 表示本轮「检查并安装更新」仍有效（可取消，含排队）；
+`installReady` 表示它已经下载并验证完成、正在等待空闲自动重启；`result` 是本轮结果
+（`rrNone`/`rrChecking`/`rrUpToDate`/`rrCandidate`/`rrCheckFailed`/`rrDownloadFailed`/`rrInstallFailed`），
+与旧候选是否仍可手动安装无关。设置页按 `result` 显示本轮结果，不解析 `error` 字符串。
+托盘只在 `upReady` 显示「重启更新」。
 `error` 为诊断信息，视图可用本地化且更简短的说明，不应直接把内部路径作为常规提示。
 
 ## 本地更新流程
@@ -27,6 +38,16 @@
 - 检查尝试（含失败）以 24 小时为间隔，记录保存在当前用户
   `%LOCALAPPDATA%\ToolDream\Shiguang\update\update.settings`。时钟回退重置节流基点，不立即重试。
   Win32 启动、定时器和休眠恢复触发同一策略；网络与 ZIP 校验在工作线程。
+- 「检查并安装更新」的一次性授权只存在于内存：检查失败、没有可用更新、下载或验签失败、持久化失败、
+  切换通道和普通退出都会撤销它，进程重启后不会自动安装。授权只在本轮检查返回的**完整 `UpdateBuild`
+  身份**等于被采纳的候选时才固定（低于旧缓存或同序号不同身份都保留原缓存并撤销授权），绝不用旧缓存代替。
+  自动安装只在 `upReady`、`installReady` 为真、暂存与候选一致、`sg_update_can_restart()` 确认空闲，
+  并且首个 ready 观察后已过 `CancelWindowSeconds` 时申请；失败一次后只保留手动「重启更新」，不会按节拍反复重启。
+  取消命令经 `PostMessage` 进入同一条消息；只保证**在自动启动尝试之前已被处理的取消**生效，不承诺点击与定时 tick 的物理先后
+  （Leaf 先排 session 事件、用户回调再投递消息，队列次序是源码可推导的窗口，未经实机验证）。
+- 发现流程把"没有更新的发布"和"符合通道/版本条件、但签名或清单校验被拒绝的发布"分开：后者
+  令本轮检查失败（`rrCheckFailed`），不会被显示成「已是最新版本」，也不会采用任何未通过验签的包；
+  若同一列表另有合法候选，仍按原路由选中它。
 - 下载结果仅在当次运行可用于重启。普通退出不启动助手，不等待正在进行的网络传输。
   失败日志或尚未完成清理的工作目录可留在更新目录；不要把它们当作已安装的版本。
 - 节流持久化失败进入 `upCheckFailed`，保留上次成功的 `settings.lastCheck`，使用单调时钟冷却 60 秒；UI 按状态获取失败，不必解析英文诊断。

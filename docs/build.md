@@ -44,7 +44,16 @@ git -C ../leaf rev-parse HEAD
 
 ## 光点图标
 
-窗口、托盘和 EXE 使用资源 `src/shiguang.ico`。常规构建直接嵌入此资源，不需要 SVG 工具。设计更新时，从仓库根目录运行 `python3 scripts/generate_icon.py`，用 `rsvg-convert` 将 `docs/images/logo.svg` 导出为 16–256 px 的九个尺寸。复现当前资源使用 librsvg 2.62.3 / Cairo 1.18.4；不同渲染器版本可能改变 PNG 编码。
+窗口、托盘、`shiguang.exe` 和 `shiguang-updater.exe` 使用同一个 `src/shiguang.ico`。常规构建直接嵌入此资源，不需要 SVG 工具。设计更新时，从仓库根目录运行 `python3 scripts/generate_icon.py`，用 `rsvg-convert` 将 `docs/images/logo.svg` 导出为 16–256 px 的九个尺寸。复现当前资源使用 librsvg 2.62.3 / Cairo 1.18.4；不同渲染器版本可能改变 PNG 编码。
+
+如需在本地单独构建带图标的更新助手（先创建 `build` 目录）：
+
+~~~powershell
+windres -I src -i src/shiguang-updater.rc -o build/shiguang-updater-icon.o
+if ($LASTEXITCODE -ne 0) { throw "拾光更新助手图标资源构建失败" }
+nim c -d:release --cc:gcc --app:gui --passL:build/shiguang-updater-icon.o --nimcache:build/helper-cache --out:build/shiguang-updater.exe src/updater_helper.nim
+if ($LASTEXITCODE -ne 0) { throw "拾光更新助手构建失败" }
+~~~
 
 没有传入构建身份的本地产物显示「当前版本 未知」。本地构建不会自动获得发布签名信任，见 [更新后端接线](update_backend.md) 与 [发布流水线](release.md)。
 

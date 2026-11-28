@@ -1,9 +1,9 @@
 ## Main-thread adapter. The future Settings view uses these same actions as the tray.
-import std/[options, os, strutils, times]
+import std/[monotimes, options, os, strutils, times]
 import update_http, update_install, update_package, update_policy, update_service, update_windows
 import updater
 
-export update_policy, updater.UpdateSnapshot, updater.UpdatePhase
+export update_policy, updater.RoundResult, updater.UpdateSnapshot, updater.UpdatePhase
 
 var
   service: UpdateService
@@ -61,6 +61,30 @@ proc changeAutoDownload*(enabled: bool): bool =
 proc downloadUpdate*(): bool =
   if service != nil: result = service.download()
   notify()
+
+proc checkForUpdates*(): bool =
+  ## "Check and install": bypasses only the daily window, then downloads and
+  ## verifies this round's candidate before any restart is requested.
+  if service != nil:
+    try: result = service.checkNow(getTime().toUnix())
+    except CatchableError as e: bridgeError = e.msg
+  notify()
+
+proc cancelUpdateAutoInstall*(): bool =
+  ## Revokes the one-shot authorization; a running transfer and its verified
+  ## stage stay for the manual "重启更新" action.
+  if service != nil: result = service.cancelAutoInstall()
+  notify()
+
+proc autoInstallArmed*(): bool =
+  service != nil and service.installArmed()
+
+proc autoInstallDue*(): bool =
+  ## Timer turn only: starts or advances the visible cancel window and reports
+  ## whether this authorized round may restart now. Never called while rendering.
+  if service == nil: return false
+  try: result = service.installDue(getMonoTime().ticks div 1_000_000_000)
+  except CatchableError as e: bridgeError = e.msg
 
 proc persistPrepared(path, expected: string) =
   let existing = readBounded(path, expected.len, missing = true)

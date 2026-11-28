@@ -1,4 +1,5 @@
 #include "shiguang_icon.h"
+1 24 "shiguang.manifest"
 IDI_SHIGUANG ICON "shiguang.ico"
 
 102 RCDATA "lucide/NOTICE"

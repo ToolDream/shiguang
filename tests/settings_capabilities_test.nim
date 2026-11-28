@@ -573,10 +573,15 @@ when defined(windows) and defined(amd64):
     let rt = newRuntime(guarded)
     defer: rt.closeRuntime()
     const MaxPumpMessages = 64
+    const MaxCoalescedHostTicks = 512
+    const ProbeQuitMessage = WM_APP + 101'u32
+    const ProbePeekNoRemove = 0'u32
     const ExitQueueEmpty = 98
     const ExitBudgetExceeded = 99
+    var root: HWND
     var pumpSteps = 0
     var hostTicks = 0
+    var coalescedHostTicks = 0
     var quitObserved = false
     var queueEmptyWithoutQuit = false
     var budgetExceeded = false
@@ -597,11 +602,27 @@ when defined(windows) and defined(amd64):
         message.message = WM_QUIT
         message.wParam = WPARAM(ExitQueueEmpty)
         return 0
-      if message.message == WM_QUIT:
+      if root != nil and message.hwnd == root and message.message == ProbeQuitMessage:
         quitObserved = true
+        message.message = WM_QUIT
+        return 0
+      if message.message == WM_QUIT:
         return 0
       if message.message == WM_HOST_TICK:
         inc hostTicks
+        if root != nil and message.hwnd == root:
+          # Leaf's shadcn controlProc posts an uncoalesced WM_HOST_TICK on every child
+          # WM_WINDOWPOSCHANGED during mount/relayout. Coalesce consecutive duplicate
+          # ticks at the queue head without crossing the FIFO sentinel or other messages.
+          var coalesced = 0
+          var nextMsg: MSG
+          while coalesced < MaxCoalescedHostTicks and
+              realPeekMessage(addr nextMsg, w, first, last, ProbePeekNoRemove) != 0 and
+              nextMsg.hwnd == root and nextMsg.message == WM_HOST_TICK:
+            if realPeekMessage(addr nextMsg, root, WM_HOST_TICK, WM_HOST_TICK, PM_REMOVE) == 0:
+              break
+            inc coalesced
+            inc coalescedHostTicks
       1
     hostCalls.waitFrameMessage = proc(timer: HANDLE): DWORD =
       raise newException(CatchableError, "unexpected blocking frame wait in bounded settings probe")
@@ -619,19 +640,22 @@ when defined(windows) and defined(amd64):
     var styleSync = SettingsStyleSync()
     app_host.bindSettingsSafeTick(window, native, rt, addr styleSync)
     doAssert app_host.sg_bind_settings(window.windowHandle()) != 0
-    let root = window.windowHandle()
+    root = window.windowHandle()
     proc pumpBounded(exitCode: int32, label: string) =
       pumpSteps = 0
       hostTicks = 0
+      coalescedHostTicks = 0
       quitObserved = false
       queueEmptyWithoutQuit = false
       budgetExceeded = false
-      PostQuitMessage(exitCode)
+      doAssert PostMessageW(root, ProbeQuitMessage, WPARAM(exitCode), 0) != 0,
+        label & " failed to post probe sentinel"
       let actual = window.pump()
       doAssert actual == int(exitCode) and quitObserved and
         not queueEmptyWithoutQuit and not budgetExceeded,
         label & " bounded pump failed: exit=" & $actual & " expected=" & $exitCode &
         " steps=" & $pumpSteps & " hostTicks=" & $hostTicks &
+        " coalescedHostTicks=" & $coalescedHostTicks &
         " quitObserved=" & $quitObserved &
         " queueEmpty=" & $queueEmptyWithoutQuit &
         " budgetExceeded=" & $budgetExceeded
